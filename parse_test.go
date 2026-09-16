@@ -1,6 +1,7 @@
 package pipelinestore_test
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 
@@ -72,6 +73,31 @@ func TestT24_UnknownKeyNullAndReservedClass(t *testing.T) {
 	wantCode(t, err, ps.CodeUnsupportedCapability)
 	if !strings.Contains(err.Error(), "TP-R1/TP-R2") {
 		t.Fatalf("expected TP-R1/TP-R2 detail, got %v", err)
+	}
+}
+
+// Finding 3 regression: invalid UTF-8 in the contract bytes is rejected up front
+// (fail closed) BEFORE decoding. Two DISTINCT malformed byte sequences must both
+// be rejected — without the guard the JSON decoder would collapse each into the
+// U+FFFD replacement character during string decoding, silently merging them and
+// accepting the body.
+func TestParse_InvalidUTF8Rejected(t *testing.T) {
+	// A structurally valid contract whose node_id is a placeholder we replace
+	// with raw invalid-UTF-8 bytes.
+	base := `{"semantic_derivation_version":"pipelinestore.pipeline-contract.v1","canonicalization_version":"pipelinestore.pipeline-contract.v1",` +
+		`"nodes":[{"node_id":"XX","tool_function_cas_hash":"cas-a","fixed_parameters":[]}],` +
+		`"direct_edges":[],"reusable_asset_bindings":[],"external_input_slots":[]}`
+
+	// Two different malformed byte sequences (a lone 0xFF vs a lone 0x80). Both
+	// would decode to the same replacement character if not rejected first.
+	seq1 := bytes.Replace([]byte(base), []byte("XX"), []byte{'a', 0xff}, 1)
+	seq2 := bytes.Replace([]byte(base), []byte("XX"), []byte{'a', 0x80}, 1)
+
+	if _, err := ps.Parse(seq1); ps.CodeOf(err) != ps.CodeInvalidContract {
+		t.Fatalf("seq1 (0xff): expected INVALID_CONTRACT, got %v", err)
+	}
+	if _, err := ps.Parse(seq2); ps.CodeOf(err) != ps.CodeInvalidContract {
+		t.Fatalf("seq2 (0x80): expected INVALID_CONTRACT, got %v", err)
 	}
 }
 

@@ -104,13 +104,19 @@ func (s *Store) Commit(ctx context.Context, req ps.CommitRequest) (ps.CommitResu
 		return ps.CommitResult{}, fmt.Errorf("sqlitestore: empty pipeline_id")
 	}
 
-	// Full validation + canonicalization + digest BEFORE any persistence. Any
-	// failure returns here with zero mutation.
-	prep, err := ps.Prepare(ctx, req.Contract, s.res)
+	// Resolver-INDEPENDENT parse + canonicalization + digest BEFORE any
+	// persistence and BEFORE any external resolver call. This derives the
+	// operation-replay / content-convergence identity from canonical-equivalent
+	// body semantics (not raw request bytes) so that a retry of an
+	// already-committed operation can be replayed even when the external
+	// resolvers are now unavailable or the catalog has drifted. Full resolver
+	// validation is deferred to genuinely new operations (step 3). Any parse/
+	// canonicalization failure returns here with zero mutation.
+	pre, err := ps.PrepareUnvalidated(req.Contract)
 	if err != nil {
 		return ps.CommitResult{}, err
 	}
-	fingerprint := requestFingerprint(req.PipelineID, prep.Digest)
+	fingerprint := requestFingerprint(req.PipelineID, pre.Digest)
 
 	// Begin the transaction for the atomic three-table transition (revision +
 	// operation ledger + digest index). modernc.org/sqlite opens a deferred
@@ -166,7 +172,7 @@ func (s *Store) Commit(ctx context.Context, req ps.CommitRequest) (ps.CommitResu
 	var convergedRevID string
 	err = tx.QueryRowContext(ctx,
 		`SELECT revision_id FROM digest_index WHERE pipeline_id = ? AND canonicalization_version = ? AND contract_digest = ?`,
-		req.PipelineID, prep.Contract.CanonicalizationVersion, prep.Digest,
+		req.PipelineID, pre.Contract.CanonicalizationVersion, pre.Digest,
 	).Scan(&convergedRevID)
 	switch {
 	case err == nil:
@@ -196,7 +202,18 @@ func (s *Store) Commit(ctx context.Context, req ps.CommitRequest) (ps.CommitResu
 		return ps.CommitResult{}, fmt.Errorf("sqlitestore: digest index lookup: %w", err)
 	}
 
-	// 3. Mint a fresh, opaque RevisionID and stage the atomic three-table write.
+	// 3. Genuinely new operation (neither an idempotent replay nor a content
+	// convergence): NOW run the full resolver validation before minting. This is
+	// the only path that calls the external resolvers. A validation failure
+	// returns here with zero mutation (the transaction is rolled back by the
+	// deferred guard). prep.Digest is identical to pre.Digest (same
+	// canonicalization), so the fingerprint recorded below stays consistent.
+	prep, err := ps.Prepare(ctx, req.Contract, s.res)
+	if err != nil {
+		return ps.CommitResult{}, err
+	}
+
+	// Mint a fresh, opaque RevisionID and stage the atomic three-table write.
 	revID := uuid.NewString()
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO revisions (pipeline_id, revision_id, contract_digest, semantic_derivation_version, canonicalization_version, canonical_body)

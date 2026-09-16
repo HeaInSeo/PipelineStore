@@ -213,6 +213,31 @@ func TestT22_CardinalityUnsupported(t *testing.T) {
 	wantCode(t, validateBody(t, body), ps.CodeCardinalityUnsupported)
 }
 
+// Finding 1 regression: a reusable_asset_binding whose RESOLVED Sori member
+// cardinality is non-SINGLE (MULTIPLE here) is rejected through the v1
+// capability gate, even though the TARGET INPUT is SINGLE and the Q16 formats
+// match. The SINGLE-member case still validates cleanly.
+func TestReusableAssetMemberCardinalityGated(t *testing.T) {
+	// Target input cas-ref/"ref" is fasta + SINGLE + required; asset member
+	// "assetmulti" is fasta (Q16 ok) but resolved cardinality MULTIPLE.
+	multi := `{"semantic_derivation_version":"pipelinestore.pipeline-contract.v1","canonicalization_version":"pipelinestore.pipeline-contract.v1",
+      "nodes":[{"node_id":"r","tool_function_cas_hash":"cas-ref","fixed_parameters":[]}],
+      "direct_edges":[],
+      "reusable_asset_bindings":[{"to_node_id":"r","to_input_port":"ref","asset_id":"assetmulti","asset_revision_id":"rev1","member_key":"mem1"}],
+      "external_input_slots":[]}`
+	wantCode(t, validateBody(t, multi), ps.CodeCardinalityUnsupported)
+
+	// The SINGLE-member equivalent (asset1) still passes.
+	single := `{"semantic_derivation_version":"pipelinestore.pipeline-contract.v1","canonicalization_version":"pipelinestore.pipeline-contract.v1",
+      "nodes":[{"node_id":"r","tool_function_cas_hash":"cas-ref","fixed_parameters":[]}],
+      "direct_edges":[],
+      "reusable_asset_bindings":[{"to_node_id":"r","to_input_port":"ref","asset_id":"asset1","asset_revision_id":"rev1","member_key":"mem1"}],
+      "external_input_slots":[]}`
+	if err := validateBody(t, single); err != nil {
+		t.Fatalf("SINGLE resolved member cardinality should validate, got %v", err)
+	}
+}
+
 // T23: duplicate slot_id or a slot reused for multiple targets -> reject.
 func TestT23_SlotViolations(t *testing.T) {
 	// Same slot_id reused for two different targets.

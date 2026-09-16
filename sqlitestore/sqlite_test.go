@@ -64,6 +64,89 @@ func mustCommit(t *testing.T, s *Store, op, pipeline string, body []byte) ps.Com
 	return res
 }
 
+// togglingToolFunc wraps a ToolFunctionResolver and returns an error whenever
+// *fail is true, so a test can make the external resolver "unavailable" between
+// commits on the same store.
+type togglingToolFunc struct {
+	inner ps.ToolFunctionResolver
+	fail  *bool
+}
+
+func (r togglingToolFunc) ResolveToolFunction(ctx context.Context, casHash string) (ps.ToolFunctionDecl, error) {
+	if *r.fail {
+		return ps.ToolFunctionDecl{}, errors.New("tool-function resolver forced unavailable")
+	}
+	return r.inner.ResolveToolFunction(ctx, casHash)
+}
+
+// Finding 2 regression: durable operation REPLAY (and OperationID conflict
+// detection) must precede external resolver revalidation. A retry of an
+// already-succeeded operation with the same body must recover and return the
+// existing revision WITHOUT calling the resolvers again — proven here by making
+// the resolver fail on every call after the first successful commit. Genuinely
+// new operations must still run full resolver validation.
+func TestReplayPrecedesResolverRevalidation(t *testing.T) {
+	fail := false
+	base := testResolvers()
+	res := ps.Resolvers{
+		ToolFunction: togglingToolFunc{inner: base.ToolFunction, fail: &fail},
+		Sori:         base.Sori,
+	}
+	path := filepath.Join(t.TempDir(), "store.db")
+	s, err := Open(path, res)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	ctx := context.Background()
+
+	// First commit succeeds while the resolver is available.
+	r1 := mustCommit(t, s, "op1", "pipe", validBody)
+
+	// Resolver now "unavailable" for every subsequent call.
+	fail = true
+
+	// Same operation + same body: replay must return the existing revision
+	// WITHOUT touching the (now-failing) resolver.
+	r2, err := s.Commit(ctx, ps.CommitRequest{OperationID: "op1", PipelineID: "pipe", Contract: validBody})
+	if err != nil {
+		t.Fatalf("idempotent replay must not call the resolver, got %v", err)
+	}
+	if r2.Created {
+		t.Fatal("replay must not create a new revision")
+	}
+	if r2.Revision.RevisionID != r1.Revision.RevisionID {
+		t.Fatalf("replay must return the original revision, got %s vs %s", r2.Revision.RevisionID, r1.Revision.RevisionID)
+	}
+
+	// Same operation + DIFFERENT body: still OPERATION_CONFLICT, zero mutation,
+	// and still decided without the resolver.
+	_, err = s.Commit(ctx, ps.CommitRequest{OperationID: "op1", PipelineID: "pipe", Contract: bodyWithThreads("2")})
+	if ps.CodeOf(err) != ps.CodeOperationConflict {
+		t.Fatalf("same op + different body: expected OPERATION_CONFLICT, got %v", err)
+	}
+	if got := s.revisionCount(t); got != 1 {
+		t.Fatalf("conflict must not mutate: expected 1 revision, got %d", got)
+	}
+
+	// Genuinely new operation with a new body while the resolver is unavailable:
+	// full validation runs and surfaces the resolver failure.
+	_, err = s.Commit(ctx, ps.CommitRequest{OperationID: "op2", PipelineID: "pipe", Contract: bodyWithThreads("2")})
+	if ps.CodeOf(err) != ps.CodeToolFunctionUnresolved {
+		t.Fatalf("genuinely new op must run full resolver validation, expected TOOL_FUNCTION_UNRESOLVED, got %v", err)
+	}
+	if got := s.revisionCount(t); got != 1 {
+		t.Fatalf("failed new op must not mutate: expected 1 revision, got %d", got)
+	}
+
+	// With the resolver restored, the genuinely new operation succeeds.
+	fail = false
+	r3 := mustCommit(t, s, "op2", "pipe", bodyWithThreads("2"))
+	if !r3.Created {
+		t.Fatal("genuinely new op should create a revision once the resolver is available")
+	}
+}
+
 // T04 (identity half): same body under different PipelineID -> same content
 // digest but distinct revision identity.
 func TestT04_DistinctIdentitySameDigest(t *testing.T) {

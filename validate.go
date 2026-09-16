@@ -132,6 +132,13 @@ func Validate(ctx context.Context, c *PipelineContract, res Resolvers) error {
 		if err != nil {
 			return newErr(CodeAssetUnresolved, "reusable asset %q rev %q member %q unverifiable: %v", bnd.AssetID, bnd.AssetRevisionID, bnd.MemberKey, err)
 		}
+		// Gate the RESOLVED asset member's cardinality through the v1 capability
+		// gate, not only the target input's: v1 supports ONLY SINGLE. A MULTIPLE/
+		// COMPOSITE/SCATTER/UNSPECIFIED resolved member is out of profile and is
+		// rejected before persistence (fail closed).
+		if err := checkCardinality(member.Cardinality, fmt.Sprintf("asset %s rev %s member %s", bnd.AssetID, bnd.AssetRevisionID, bnd.MemberKey)); err != nil {
+			return err
+		}
 		if err := checkCardinality(in.Cardinality, fmt.Sprintf("input %s.%s", bnd.ToNodeID, bnd.ToInputPort)); err != nil {
 			return err
 		}

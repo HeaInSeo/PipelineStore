@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"strings"
+	"unicode/utf8"
 )
 
 // Parse strictly decodes a v1 pipeline-contract JSON body.
@@ -18,6 +19,12 @@ import (
 // No Unicode normalization, case-folding, or trimming is performed: byte-distinct
 // strings (e.g. NFC vs NFD) remain distinct.
 func Parse(data []byte) (*PipelineContract, error) {
+	// Reject invalid UTF-8 BEFORE any decoding/tokenization: distinct malformed
+	// byte sequences must not collapse into the Unicode replacement character
+	// during decoding (fail closed).
+	if !utf8.Valid(data) {
+		return nil, newErr(CodeInvalidContract, "contract bytes are not valid UTF-8")
+	}
 	if err := checkStrictJSON(data); err != nil {
 		return nil, err
 	}

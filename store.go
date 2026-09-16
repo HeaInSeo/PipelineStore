@@ -66,10 +66,28 @@ type Prepared struct {
 	Digest    string
 }
 
+// PrepareUnvalidated runs the resolver-INDEPENDENT portion of Prepare: strict
+// parse, canonicalization, and digest. It performs NO semantic validation and
+// calls NO resolvers.
+//
+// It exists so a durable store can compute the canonical body digest — the
+// operation-replay and content-convergence identity — WITHOUT invoking the
+// external resolvers. Idempotent replay and OperationID conflict detection are
+// therefore decided on canonical-equivalent body semantics, never on raw
+// request bytes, and never depend on external resolver availability. Genuinely
+// new operations still go through full Prepare (with validation) before minting.
+func PrepareUnvalidated(body []byte) (*Prepared, error) {
+	c, err := Parse(body)
+	if err != nil {
+		return nil, err
+	}
+	return prepareCanonical(c)
+}
+
 // Prepare runs the full pre-persistence pipeline: strict parse, semantic
 // validation, canonicalization, and digest. Any failure is returned before the
 // caller performs any persistence. Store implementations call Prepare before
-// touching durable state.
+// touching durable state (for genuinely new operations).
 func Prepare(ctx context.Context, body []byte, res Resolvers) (*Prepared, error) {
 	c, err := Parse(body)
 	if err != nil {
@@ -78,9 +96,15 @@ func Prepare(ctx context.Context, body []byte, res Resolvers) (*Prepared, error)
 	if err := Validate(ctx, c, res); err != nil {
 		return nil, err
 	}
+	return prepareCanonical(c)
+}
+
+// prepareCanonical canonicalizes a parsed contract, re-parses the canonical form
+// so the stored/returned Contract is exactly what the digest covers (and to
+// confirm canonicalization is idempotent), and computes the digest. It is the
+// shared, resolver-independent tail of Prepare and PrepareUnvalidated.
+func prepareCanonical(c *PipelineContract) (*Prepared, error) {
 	canon := Canonicalize(c)
-	// Re-parse the canonical form so the stored/returned Contract is exactly what
-	// the digest covers, and confirm the canonicalization is idempotent.
 	cc, err := Parse(canon)
 	if err != nil {
 		return nil, newErr(CodeInvalidContract, "canonical form failed re-parse: %v", err)

@@ -52,6 +52,10 @@ func baseResolvers() ps.Resolvers {
 	sori.Add("asset1", "rev1", "mem1", ps.AssetMemberDecl{DataFormat: "fasta", Cardinality: ps.CardinalitySingle})
 	// A member whose format does not match a fasta input (for Q16 tests).
 	sori.Add("assetbad", "rev1", "mem1", ps.AssetMemberDecl{DataFormat: "bam", Cardinality: ps.CardinalitySingle})
+	// A member whose data format matches the fasta "ref" input and whose target
+	// input is SINGLE, but whose RESOLVED member cardinality is MULTIPLE (out of
+	// v1 profile). Used to prove the resolved member cardinality is gated.
+	sori.Add("assetmulti", "rev1", "mem1", ps.AssetMemberDecl{DataFormat: "fasta", Cardinality: ps.CardinalityMultiple})
 
 	return ps.Resolvers{ToolFunction: tf, Sori: sori}
 }
