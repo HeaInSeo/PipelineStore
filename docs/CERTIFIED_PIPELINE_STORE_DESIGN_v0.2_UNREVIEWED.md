@@ -1,3 +1,13 @@
+> # ⚠️ HISTORICAL / SUPERSEDED / NON-NORMATIVE
+>
+> **이 문서는 현재 권위가 아닙니다.** 역사적 기록으로만 보존되며, 설계 근거나 구현 기준으로 인용해서는 안 됩니다.
+>
+> 현재 권위는 다음 순서로 확인하십시오:
+>
+> **Current Authority Router → Constitution → Architecture**
+>
+> 2026-08-29 Pipeline Plane 독립 설계·반증 결과 이 문서의 모델은 대체되었습니다. 아래 본문은 당시 판단을 그대로 남긴 것으로, 이후 결정과 충돌하는 내용이 포함되어 있습니다.
+
 # Certified Pipeline Store 설계 v0.2 (draft)
 
 상태: 초안 (v0.1의 §10 미결정 사항 중 1~6번을 결정 반영, 7번 정책 스케줄러는 여전히 별도 컴포넌트로 범위 밖)
