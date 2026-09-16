@@ -25,9 +25,11 @@ func Canonicalize(c *PipelineContract) []byte {
 	writeStringField(&b, "canonicalization_version", c.CanonicalizationVersion)
 	b.WriteByte(',')
 
-	// nodes: sort by node_id.
+	// nodes: sort by node_id. Stable so the emitted bytes stay deterministic even
+	// if a caller invokes Digest() directly on unvalidated input containing
+	// duplicate node_ids (the commit path rejects duplicates before canonicalizing).
 	nodes := append([]Node(nil), c.Nodes...)
-	sort.Slice(nodes, func(i, j int) bool { return nodes[i].NodeID < nodes[j].NodeID })
+	sort.SliceStable(nodes, func(i, j int) bool { return nodes[i].NodeID < nodes[j].NodeID })
 	b.WriteString(`"nodes":[`)
 	for i := range nodes {
 		if i > 0 {

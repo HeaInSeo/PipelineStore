@@ -219,6 +219,25 @@ func TestT19_IntegrityFailClosed(t *testing.T) {
 	}
 }
 
+// Read-path fails closed when a redundant version column is tampered while the
+// canonical body + digest stay mutually consistent (the body is authoritative
+// and digest-protected; a drifted column must not be returned). Guards the §8
+// "fail closed on any mismatch" contract symmetrically across both version columns.
+func TestReadCrossChecksVersionColumns(t *testing.T) {
+	s, _ := openTemp(t)
+	r := mustCommit(t, s, "op1", "pipe", validBody)
+	// Tamper ONLY the semantic_derivation_version column; canonical_body and
+	// contract_digest remain mutually consistent, so the digest check passes.
+	if _, err := s.db.Exec(`UPDATE revisions SET semantic_derivation_version = ? WHERE pipeline_id = ? AND revision_id = ?`,
+		"evil", "pipe", string(r.Revision.RevisionID)); err != nil {
+		t.Fatalf("tamper semver column: %v", err)
+	}
+	_, err := s.GetRevision(context.Background(), "pipe", r.Revision.RevisionID)
+	if ps.CodeOf(err) != ps.CodeIntegrity {
+		t.Fatalf("expected INTEGRITY_ERROR on semantic_derivation_version column drift, got %v", err)
+	}
+}
+
 // T28: an acknowledged commit survives restart and an exact read passes digest
 // integrity.
 func TestT28_AckSurvivesRestart(t *testing.T) {

@@ -112,8 +112,11 @@ func (s *Store) Commit(ctx context.Context, req ps.CommitRequest) (ps.CommitResu
 	}
 	fingerprint := requestFingerprint(req.PipelineID, prep.Digest)
 
-	// BEGIN IMMEDIATE so the write intent is taken up-front and the three-table
-	// transition is atomic.
+	// Begin the transaction for the atomic three-table transition (revision +
+	// operation ledger + digest index). modernc.org/sqlite opens a deferred
+	// transaction here; writes are fully serialized by SetMaxOpenConns(1), and
+	// the operations/digest_index primary keys are hard duplicate guards, so a
+	// deferred begin is sufficient for atomicity and idempotency.
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return ps.CommitResult{}, fmt.Errorf("sqlitestore: begin: %w", err)
@@ -288,6 +291,17 @@ func loadRevisionTx(ctx context.Context, tx *sql.Tx, pipelineID, revisionID stri
 	contract, err := ps.Parse(body)
 	if err != nil {
 		return nil, &ps.Error{Code: ps.CodeIntegrity, Msg: fmt.Sprintf("stored body failed strict re-parse: %v", err)}
+	}
+	// The redundant version columns must agree with the digest-protected body;
+	// fail closed on any drift (the body is authoritative and integrity-checked
+	// above, the columns are convenience indexes). This mirrors the
+	// canonicalization_version gate and keeps §8 "fail closed on any mismatch"
+	// symmetric across both stored version fields.
+	if semVer != contract.SemanticDerivationVersion {
+		return nil, &ps.Error{Code: ps.CodeIntegrity, Msg: "stored semantic_derivation_version disagrees with digest-protected body"}
+	}
+	if canonVer != contract.CanonicalizationVersion {
+		return nil, &ps.Error{Code: ps.CodeIntegrity, Msg: "stored canonicalization_version disagrees with digest-protected body"}
 	}
 
 	return &ps.PipelineRevision{
