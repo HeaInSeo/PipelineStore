@@ -81,7 +81,33 @@ func PrepareUnvalidated(body []byte) (*Prepared, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Fail closed on any PRESENT reserved capability BEFORE the canonical
+	// identity is derived. The canonical form intentionally omits
+	// tool_profile_digest, so without this a body carrying it would produce the
+	// same replay/convergence identity as one without it and could
+	// success-short-circuit before the full validation that rejects it. This is a
+	// pure structural check (no resolver), so it runs on the replay, convergence,
+	// and new-mint paths alike.
+	if err := rejectReservedCapabilities(c); err != nil {
+		return nil, err
+	}
 	return prepareCanonical(c)
+}
+
+// rejectReservedCapabilities fails closed on any known-but-inactive reserved
+// capability that must not participate in the resolver-independent replay /
+// convergence identity. In v1 the only such capability is tool_profile_digest
+// (TP-R1/TP-R2): PRESENT (a non-nil pointer) is rejected — both an empty-string
+// and a non-empty value — while ABSENT (nil) is the sole accepted state and is
+// the only one that proceeds into the canonical identity.
+func rejectReservedCapabilities(c *PipelineContract) error {
+	for i := range c.Nodes {
+		if c.Nodes[i].ToolProfileDigest != nil {
+			return newErrDetail(CodeUnsupportedCapability, "TP-R1/TP-R2",
+				"node %q sets reserved tool_profile_digest; ToolProfile pinning is not an active v1 capability", c.Nodes[i].NodeID)
+		}
+	}
+	return nil
 }
 
 // Prepare runs the full pre-persistence pipeline: strict parse, semantic

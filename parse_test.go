@@ -101,6 +101,55 @@ func TestParse_InvalidUTF8Rejected(t *testing.T) {
 	}
 }
 
+// P2 regression: JSON *escaped* lone surrogates (e.g. \ud800 / \udc00) are
+// rejected before decode. utf8.Valid on the raw bytes cannot catch these (the
+// surrogate is an ASCII \u escape), and the strict JSON decoder would silently
+// coerce each to U+FFFD — collapsing distinct malformed values. A valid
+// high+low surrogate pair must still be accepted.
+func TestParse_EscapedSurrogates(t *testing.T) {
+	base := `{"semantic_derivation_version":"pipelinestore.pipeline-contract.v1","canonicalization_version":"pipelinestore.pipeline-contract.v1",` +
+		`"nodes":[{"node_id":"NODEID","tool_function_cas_hash":"cas-a","fixed_parameters":[]}],` +
+		`"direct_edges":[],"reusable_asset_bindings":[],"external_input_slots":[]}`
+	withNodeID := func(id string) string { return strings.Replace(base, "NODEID", id, 1) }
+
+	// Lone high surrogate -> rejected.
+	loneHigh := withNodeID(`\ud800`)
+	if _, err := ps.Parse([]byte(loneHigh)); ps.CodeOf(err) != ps.CodeInvalidContract {
+		t.Fatalf("lone high surrogate: expected INVALID_CONTRACT, got %v", err)
+	}
+
+	// Lone low surrogate -> rejected.
+	loneLow := withNodeID(`\udc00`)
+	if _, err := ps.Parse([]byte(loneLow)); ps.CodeOf(err) != ps.CodeInvalidContract {
+		t.Fatalf("lone low surrogate: expected INVALID_CONTRACT, got %v", err)
+	}
+
+	// Two DISTINCT lone-surrogate values must both be rejected distinctly — they
+	// must NOT collapse (to U+FFFD) into an accepted, converging body.
+	if _, err := ps.Parse([]byte(loneHigh)); err == nil {
+		t.Fatal("distinct lone high must be rejected, not collapsed")
+	}
+	errHigh := func() error { _, e := ps.Parse([]byte(loneHigh)); return e }()
+	errLow := func() error { _, e := ps.Parse([]byte(loneLow)); return e }()
+	if errHigh == nil || errLow == nil {
+		t.Fatal("both distinct lone surrogates must be rejected")
+	}
+	if errHigh.Error() == errLow.Error() {
+		t.Fatalf("distinct lone surrogates must not collapse to the same rejection: %q", errHigh.Error())
+	}
+
+	// Valid high+low surrogate pair (U+10000, escaped \ud800\udc00) -> accepted,
+	// exercising the pairing-acceptance branch of the guard.
+	pair := withNodeID(`\ud800\udc00`)
+	c, err := ps.Parse([]byte(pair))
+	if err != nil {
+		t.Fatalf("valid surrogate pair must be accepted, got %v", err)
+	}
+	if len(c.Nodes) != 1 || c.Nodes[0].NodeID != "\U00010000" {
+		t.Fatalf("valid surrogate pair must decode to U+10000, got %+v", c.Nodes)
+	}
+}
+
 // Duplicate object keys are rejected (part of "duplicates REJECT").
 func TestParse_DuplicateObjectKey(t *testing.T) {
 	dup := strings.Replace(validPipelineJSON,

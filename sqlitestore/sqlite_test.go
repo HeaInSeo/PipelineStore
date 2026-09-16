@@ -34,6 +34,17 @@ func bodyWithThreads(v string) []byte {
 
 var validBody = bodyWithThreads("4")
 
+// bodyWithToolProfileDigest is semantically identical to validBody (threads=4)
+// but sets a PRESENT reserved tool_profile_digest on node "a". Because the
+// canonical form omits tool_profile_digest, this body would otherwise share
+// validBody's replay/convergence identity.
+func bodyWithToolProfileDigest(tp string) []byte {
+	return []byte(`{"semantic_derivation_version":"pipelinestore.pipeline-contract.v1","canonicalization_version":"pipelinestore.pipeline-contract.v1",
+      "nodes":[{"node_id":"a","tool_function_cas_hash":"cas-a","tool_profile_digest":"` + tp + `","fixed_parameters":[{"name":"threads","value":"4"}]},{"node_id":"b","tool_function_cas_hash":"cas-b","fixed_parameters":[]}],
+      "direct_edges":[{"from_node_id":"a","from_output_port":"out","to_node_id":"b","to_input_port":"in"}],
+      "reusable_asset_bindings":[],"external_input_slots":[]}`)
+}
+
 func openTemp(t *testing.T) (*Store, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "store.db")
@@ -144,6 +155,104 @@ func TestReplayPrecedesResolverRevalidation(t *testing.T) {
 	r3 := mustCommit(t, s, "op2", "pipe", bodyWithThreads("2"))
 	if !r3.Created {
 		t.Fatal("genuinely new op should create a revision once the resolver is available")
+	}
+}
+
+// P1 regression (replay): a PRESENT reserved tool_profile_digest must fail
+// closed with UNSUPPORTED_CAPABILITY in the resolver-independent phase, BEFORE
+// the operation-ledger replay short-circuit. Without the fix the canonical form
+// omits tool_profile_digest, so this body's fingerprint matches the earlier
+// clean commit under the same operation_id and the commit success-short-circuits
+// as an idempotent replay — never reaching the validation that rejects it.
+func TestToolProfileDigestPresentRejectedBeforeReplay(t *testing.T) {
+	s, _ := openTemp(t)
+	r1 := mustCommit(t, s, "op1", "pipe", validBody)
+
+	// Same operation_id + same semantic body + PRESENT empty-string
+	// tool_profile_digest: replay must NOT succeed.
+	_, err := s.Commit(context.Background(), ps.CommitRequest{OperationID: "op1", PipelineID: "pipe", Contract: bodyWithToolProfileDigest("")})
+	if ps.CodeOf(err) != ps.CodeUnsupportedCapability {
+		t.Fatalf("PRESENT tool_profile_digest on replay: expected UNSUPPORTED_CAPABILITY, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "TP-R1/TP-R2") {
+		t.Fatalf("expected TP-R1/TP-R2 detail, got %v", err)
+	}
+	// The original revision is untouched and still the only one.
+	if got := s.revisionCount(t); got != 1 {
+		t.Fatalf("rejection must not mutate: expected 1 revision, got %d", got)
+	}
+	if _, err := s.GetRevision(context.Background(), "pipe", r1.Revision.RevisionID); err != nil {
+		t.Fatalf("original revision must remain readable: %v", err)
+	}
+}
+
+// P1 regression (convergence): a NEW operation_id whose body converges (by
+// canonical digest) to an existing revision but carries a PRESENT
+// tool_profile_digest must fail closed with UNSUPPORTED_CAPABILITY BEFORE the
+// content-convergence short-circuit. Without the fix it would converge and
+// return the existing revision, bypassing validation.
+func TestToolProfileDigestPresentRejectedBeforeConvergence(t *testing.T) {
+	s, _ := openTemp(t)
+	mustCommit(t, s, "op1", "pipe", validBody)
+
+	_, err := s.Commit(context.Background(), ps.CommitRequest{OperationID: "op2", PipelineID: "pipe", Contract: bodyWithToolProfileDigest("sha256:abc")})
+	if ps.CodeOf(err) != ps.CodeUnsupportedCapability {
+		t.Fatalf("PRESENT tool_profile_digest on convergence: expected UNSUPPORTED_CAPABILITY, got %v", err)
+	}
+	if got := s.revisionCount(t); got != 1 {
+		t.Fatalf("rejection must not mutate: expected 1 revision, got %d", got)
+	}
+	var ops int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM operations`).Scan(&ops); err != nil {
+		t.Fatalf("count operations: %v", err)
+	}
+	if ops != 1 {
+		t.Fatalf("rejected converging op must not be recorded: expected 1 operation, got %d", ops)
+	}
+}
+
+// P1 regression (control): with tool_profile_digest ABSENT, idempotent replay
+// and content convergence still work resolver-independently — proving the
+// fail-closed guard does not regress the accepted path. The resolver is made
+// unavailable after the first commit; both replay and convergence must still
+// succeed without calling it.
+func TestToolProfileDigestAbsentPreservesReplayAndConvergence(t *testing.T) {
+	fail := false
+	base := testResolvers()
+	res := ps.Resolvers{
+		ToolFunction: togglingToolFunc{inner: base.ToolFunction, fail: &fail},
+		Sori:         base.Sori,
+	}
+	path := filepath.Join(t.TempDir(), "store.db")
+	s, err := Open(path, res)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	ctx := context.Background()
+
+	r1 := mustCommit(t, s, "op1", "pipe", validBody)
+	fail = true // resolver now unavailable
+
+	// ABSENT replay: same op + same body still returns the existing revision.
+	r2, err := s.Commit(ctx, ps.CommitRequest{OperationID: "op1", PipelineID: "pipe", Contract: validBody})
+	if err != nil {
+		t.Fatalf("absent replay must still succeed resolver-independently, got %v", err)
+	}
+	if r2.Created || r2.Revision.RevisionID != r1.Revision.RevisionID {
+		t.Fatalf("absent replay must return the original revision without minting")
+	}
+
+	// ABSENT convergence: new op + same body still converges to the existing revision.
+	r3, err := s.Commit(ctx, ps.CommitRequest{OperationID: "op2", PipelineID: "pipe", Contract: validBody})
+	if err != nil {
+		t.Fatalf("absent convergence must still succeed resolver-independently, got %v", err)
+	}
+	if r3.Created || r3.Revision.RevisionID != r1.Revision.RevisionID {
+		t.Fatalf("absent convergence must return the existing revision without minting")
+	}
+	if got := s.revisionCount(t); got != 1 {
+		t.Fatalf("expected exactly 1 revision, got %d", got)
 	}
 }
 
