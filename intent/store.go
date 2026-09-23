@@ -2,7 +2,7 @@ package intent
 
 import (
 	"context"
-	"slices"
+	"sort"
 	"sync"
 
 	"github.com/google/uuid"
@@ -335,8 +335,8 @@ func (m *MemoryStore) membershipLocked(policyID string) PolicyMembership {
 			out.RunIDAttached = append(out.RunIDAttached, id)
 		}
 	}
-	slices.Sort(out.Held)
-	slices.Sort(out.RunIDAttached)
+	sort.Slice(out.Held, func(i, j int) bool { return out.Held[i] < out.Held[j] })
+	sort.Slice(out.RunIDAttached, func(i, j int) bool { return out.RunIDAttached[i] < out.RunIDAttached[j] })
 	return out
 }
 
