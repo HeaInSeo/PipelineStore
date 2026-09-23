@@ -169,6 +169,11 @@ func Lower(in Input) (RunSpec, error) {
 		if out.Cardinality != ps.CardinalitySingle || inDecl.Cardinality != ps.CardinalitySingle {
 			return RunSpec{}, newError(ps.CodeCardinalityUnsupported, "edge %s.%s -> %s.%s is not SINGLE to SINGLE", e.FromNodeID, e.FromOutputPort, e.ToNodeID, e.ToInputPort)
 		}
+		// Re-check Q16 against the frozen declarations: the emitted spec carries
+		// no formats, so a drifted declaration could not be caught downstream.
+		if err := ps.CheckQ16(out.DataFormat, inDecl.DataFormat, fmt.Sprintf("%s.%s -> %s.%s", e.FromNodeID, e.FromOutputPort, e.ToNodeID, e.ToInputPort)); err != nil {
+			return RunSpec{}, err
+		}
 		src := port{e.FromNodeID, e.FromOutputPort}
 		if consumed[src] {
 			return RunSpec{}, newError(CodeNotRepresentable, "output %s.%s fans out to more than one input", e.FromNodeID, e.FromOutputPort)
@@ -306,13 +311,17 @@ func newError(code ps.Code, format string, args ...any) error {
 
 // checkTimestamp fails closed on a zero timestamp or one that the wire
 // encoding (time.Time.MarshalJSON, RFC 3339) rejects: a year outside 0-9999
-// or a zone offset RFC 3339 cannot express.
+// or a zone offset RFC 3339 cannot express. It also rejects a sub-minute zone
+// offset, which MarshalJSON accepts but truncates, changing the instant.
 func checkTimestamp(t time.Time, field string) error {
 	if t.IsZero() {
 		return missing(field)
 	}
 	if _, err := t.MarshalJSON(); err != nil {
 		return newError(CodeInvalidFrozenInput, "frozen input %s is not RFC 3339 encodable: %v", field, err)
+	}
+	if _, offset := t.Zone(); offset%60 != 0 {
+		return newError(CodeInvalidFrozenInput, "frozen input %s has sub-minute zone offset %ds that RFC 3339 cannot encode losslessly", field, offset)
 	}
 	return nil
 }

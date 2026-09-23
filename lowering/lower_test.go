@@ -286,6 +286,25 @@ func TestLower_MultiplePortsBetweenSameNodes(t *testing.T) {
 	}
 }
 
+// TestLower_WholeMinuteOffset checks that a whole-minute zone offset is
+// accepted and survives the wire encoding as the same instant.
+func TestLower_WholeMinuteOffset(t *testing.T) {
+	in := input(t, twoNodeJSON)
+	in.Metadata.SubmittedAt = time.Date(2026, 1, 1, 9, 30, 0, 0, time.FixedZone("", 5*3600+30*60))
+	spec := mustLower(t, in)
+	raw, err := spec.Run.SubmittedAt.MarshalJSON()
+	if err != nil {
+		t.Fatalf("marshal submittedAt: %v", err)
+	}
+	var back time.Time
+	if err := back.UnmarshalJSON(raw); err != nil {
+		t.Fatalf("unmarshal submittedAt: %v", err)
+	}
+	if !back.Equal(in.Metadata.SubmittedAt) {
+		t.Fatalf("round trip changed instant: %v -> %v", in.Metadata.SubmittedAt, back)
+	}
+}
+
 func TestLower_FailClosed(t *testing.T) {
 	cases := []struct {
 		name string
@@ -302,6 +321,12 @@ func TestLower_FailClosed(t *testing.T) {
 		}, lowering.CodeInvalidFrozenInput},
 		{"submittedAt offset beyond RFC 3339", func(in *lowering.Input) {
 			in.Metadata.SubmittedAt = time.Date(2026, 1, 1, 0, 0, 0, 0, time.FixedZone("", 24*3600))
+		}, lowering.CodeInvalidFrozenInput},
+		{"submittedAt sub-minute offset", func(in *lowering.Input) {
+			in.Metadata.SubmittedAt = time.Date(2026, 1, 1, 0, 0, 0, 0, time.FixedZone("", 1))
+		}, lowering.CodeInvalidFrozenInput},
+		{"submittedAt negative sub-minute offset", func(in *lowering.Input) {
+			in.Metadata.SubmittedAt = time.Date(2026, 1, 1, 0, 0, 0, 0, time.FixedZone("", -(5*3600 + 30*60 + 45)))
 		}, lowering.CodeInvalidFrozenInput},
 		{"empty revision id", func(in *lowering.Input) { in.Revision.RevisionID = "" }, lowering.CodeMissingFrozenInput},
 		{"empty pipeline id", func(in *lowering.Input) { in.Revision.PipelineID = "" }, lowering.CodeMissingFrozenInput},
@@ -333,6 +358,21 @@ func TestLower_FailClosed(t *testing.T) {
 			d.Inputs = map[string]ps.InputPortDecl{"in": {DataFormat: "fastq", Cardinality: ps.CardinalityMultiple, Required: true}}
 			in.ToolFunctions["cas-b"] = d
 		}, ps.CodeCardinalityUnsupported},
+		{"declaration drift: format mismatch", func(in *lowering.Input) {
+			d := in.ToolFunctions["cas-b"]
+			d.Inputs = map[string]ps.InputPortDecl{"in": {DataFormat: "bam", Cardinality: ps.CardinalitySingle, Required: true}}
+			in.ToolFunctions["cas-b"] = d
+		}, ps.CodeQ16Mismatch},
+		{"declaration drift: unknown output format", func(in *lowering.Input) {
+			d := in.ToolFunctions["cas-a"]
+			d.Outputs = map[string]ps.OutputPortDecl{"out": {DataFormat: "UNKNOWN", Cardinality: ps.CardinalitySingle}}
+			in.ToolFunctions["cas-a"] = d
+		}, ps.CodeQ16Mismatch},
+		{"declaration drift: empty input format", func(in *lowering.Input) {
+			d := in.ToolFunctions["cas-b"]
+			d.Inputs = map[string]ps.InputPortDecl{"in": {Cardinality: ps.CardinalitySingle, Required: true}}
+			in.ToolFunctions["cas-b"] = d
+		}, ps.CodeQ16Mismatch},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -458,6 +498,9 @@ func TestCheckSpec_NegativeGoldens(t *testing.T) {
 		{"zero submittedAt", func(s *lowering.RunSpec) { s.Run.SubmittedAt = time.Time{} }, lowering.CodeMissingFrozenInput},
 		{"unencodable submittedAt", func(s *lowering.RunSpec) {
 			s.Run.SubmittedAt = time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)
+		}, lowering.CodeInvalidFrozenInput},
+		{"sub-minute offset submittedAt", func(s *lowering.RunSpec) {
+			s.Run.SubmittedAt = time.Date(2026, 1, 1, 0, 0, 0, 0, time.FixedZone("", 1))
 		}, lowering.CodeInvalidFrozenInput},
 		{"no nodes", func(s *lowering.RunSpec) { s.Graph = lowering.Graph{} }, ps.CodeInvalidContract},
 		{"duplicate node", func(s *lowering.RunSpec) { s.Graph.Nodes[1].NodeID = "a" }, ps.CodeDuplicate},

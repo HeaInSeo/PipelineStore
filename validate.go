@@ -105,7 +105,7 @@ func Validate(ctx context.Context, c *PipelineContract, res Resolvers) error {
 		if err := checkCardinality(in.Cardinality, fmt.Sprintf("input %s.%s", e.ToNodeID, e.ToInputPort)); err != nil {
 			return err
 		}
-		if err := checkQ16(out.DataFormat, in.DataFormat, fmt.Sprintf("%s.%s -> %s.%s", e.FromNodeID, e.FromOutputPort, e.ToNodeID, e.ToInputPort)); err != nil {
+		if err := CheckQ16(out.DataFormat, in.DataFormat, fmt.Sprintf("%s.%s -> %s.%s", e.FromNodeID, e.FromOutputPort, e.ToNodeID, e.ToInputPort)); err != nil {
 			return err
 		}
 		providers[portRef{e.ToNodeID, e.ToInputPort}]++
@@ -142,7 +142,7 @@ func Validate(ctx context.Context, c *PipelineContract, res Resolvers) error {
 		if err := checkCardinality(in.Cardinality, fmt.Sprintf("input %s.%s", bnd.ToNodeID, bnd.ToInputPort)); err != nil {
 			return err
 		}
-		if err := checkQ16(member.DataFormat, in.DataFormat, fmt.Sprintf("asset %s -> %s.%s", bnd.AssetID, bnd.ToNodeID, bnd.ToInputPort)); err != nil {
+		if err := CheckQ16(member.DataFormat, in.DataFormat, fmt.Sprintf("asset %s -> %s.%s", bnd.AssetID, bnd.ToNodeID, bnd.ToInputPort)); err != nil {
 			return err
 		}
 		providers[portRef{bnd.ToNodeID, bnd.ToInputPort}]++
@@ -227,10 +227,11 @@ func checkCardinality(card Cardinality, where string) error {
 	return newErr(CodeCardinalityUnsupported, "%s has cardinality %q; only SINGLE is supported in v1", where, string(card))
 }
 
-// checkQ16 enforces L0 data-format compatibility: both formats must be known and
+// CheckQ16 enforces L0 data-format compatibility: both formats must be known and
 // exactly equal. A differing format would require an implicit adapter/transform,
-// which is rejected.
-func checkQ16(fromFormat, toFormat, where string) error {
+// which is rejected with CodeQ16Mismatch. It is exported so consumers of frozen
+// declarations (such as lowering) apply the same rule as commit validation.
+func CheckQ16(fromFormat, toFormat, where string) error {
 	if isUnknownFormat(fromFormat) || isUnknownFormat(toFormat) {
 		return newErr(CodeQ16Mismatch, "%s: data format is UNKNOWN/UNSPECIFIED", where)
 	}
