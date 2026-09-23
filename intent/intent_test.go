@@ -627,7 +627,7 @@ func TestRequireCommitted_RejectsMismatchedRead(t *testing.T) {
 	}
 	_, err = svc.CreateAutomatic(context.Background(), autoReq())
 	assertCode(t, err, ps.CodeNotFound)
-	assertUnchanged(t, store, storeState{intents: map[ID]Intent{}, auto: map[autoKey]ID{}, ops: map[string]ID{}, runs: map[RunID]ID{}})
+	assertUnchanged(t, store, snapshot(NewMemoryStore()))
 }
 
 type mismatchedReader struct{}
