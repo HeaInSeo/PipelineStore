@@ -1,0 +1,18 @@
+// Package intent implements the PIPE-I0 pre-Run RunGenerationIntent core:
+// automatic uniqueness over (AutoRunPolicyID, InputBindingSubjectIdentity),
+// frozen policy/pipeline revisions, explicit operation idempotency, and
+// attach-only assignment of an externally allocated RunID.
+//
+// An intent always refers to an exact committed PipelineRevision coordinate
+// (PipelineID, PipelineRevisionID) issued by PIPE-I1 and confirmed through an
+// exact read before any intent state is written. This package never recomputes
+// contract digests, derives revision identities, or resolves "latest".
+//
+// Scope boundary (PIPE-I0): no RunID allocation, no queue, no network or
+// process adapter, and no call into JUMI, PolicyScheduler, Tori,
+// Kubernetes/Kueue, or Authorization. Identities are opaque strings and the
+// error codes and result fields are internal; neither is a frozen public wire
+// format. MemoryStore is the reference/test implementation of the atomic Store
+// contract and is not evidence of production durability; a durable adapter is
+// a separate storage gate.
+package intent
