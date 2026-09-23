@@ -294,6 +294,15 @@ func TestLower_FailClosed(t *testing.T) {
 	}{
 		{"empty run id", func(in *lowering.Input) { in.RunID = "" }, lowering.CodeMissingFrozenInput},
 		{"zero submittedAt", func(in *lowering.Input) { in.Metadata.SubmittedAt = time.Time{} }, lowering.CodeMissingFrozenInput},
+		{"submittedAt year after 9999", func(in *lowering.Input) {
+			in.Metadata.SubmittedAt = time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)
+		}, lowering.CodeInvalidFrozenInput},
+		{"submittedAt negative year", func(in *lowering.Input) {
+			in.Metadata.SubmittedAt = time.Date(-1, 1, 1, 0, 0, 0, 0, time.UTC)
+		}, lowering.CodeInvalidFrozenInput},
+		{"submittedAt offset beyond RFC 3339", func(in *lowering.Input) {
+			in.Metadata.SubmittedAt = time.Date(2026, 1, 1, 0, 0, 0, 0, time.FixedZone("", 24*3600))
+		}, lowering.CodeInvalidFrozenInput},
 		{"empty revision id", func(in *lowering.Input) { in.Revision.RevisionID = "" }, lowering.CodeMissingFrozenInput},
 		{"empty pipeline id", func(in *lowering.Input) { in.Revision.PipelineID = "" }, lowering.CodeMissingFrozenInput},
 		{"authorization unknown", func(in *lowering.Input) { in.Authorization = lowering.DecisionUnknown }, lowering.CodeAuthorizationUnknown},
@@ -446,6 +455,10 @@ func TestCheckSpec_NegativeGoldens(t *testing.T) {
 		{"failure mode omitted", func(s *lowering.RunSpec) { s.Run.FailurePolicy.Mode = "" }, ps.CodeInvalidContract},
 		{"maxAttempts omitted", func(s *lowering.RunSpec) { s.Defaults.RetryPolicy.MaxAttempts = 0 }, ps.CodeInvalidContract},
 		{"empty run id", func(s *lowering.RunSpec) { s.Run.RunID = "" }, lowering.CodeMissingFrozenInput},
+		{"zero submittedAt", func(s *lowering.RunSpec) { s.Run.SubmittedAt = time.Time{} }, lowering.CodeMissingFrozenInput},
+		{"unencodable submittedAt", func(s *lowering.RunSpec) {
+			s.Run.SubmittedAt = time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)
+		}, lowering.CodeInvalidFrozenInput},
 		{"no nodes", func(s *lowering.RunSpec) { s.Graph = lowering.Graph{} }, ps.CodeInvalidContract},
 		{"duplicate node", func(s *lowering.RunSpec) { s.Graph.Nodes[1].NodeID = "a" }, ps.CodeDuplicate},
 		{"unpinned image", func(s *lowering.RunSpec) { s.Graph.Nodes[0].Image = "a:latest" }, lowering.CodeRunnableUnresolved},

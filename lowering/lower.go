@@ -13,6 +13,9 @@ import (
 const (
 	// CodeMissingFrozenInput is an empty required caller-frozen input.
 	CodeMissingFrozenInput ps.Code = "MISSING_FROZEN_INPUT"
+	// CodeInvalidFrozenInput is a present caller-frozen input that cannot be
+	// encoded, such as a timestamp outside RFC 3339.
+	CodeInvalidFrozenInput ps.Code = "INVALID_FROZEN_INPUT"
 	// CodeRunnableUnresolved is a missing or non-exact runnable resolution
 	// (image not pinned by sha256 digest) for a node's ToolFunction pin.
 	CodeRunnableUnresolved ps.Code = "RUNNABLE_UNRESOLVED"
@@ -83,8 +86,8 @@ func Lower(in Input) (RunSpec, error) {
 	if in.RunID == "" {
 		return RunSpec{}, missing("RunID")
 	}
-	if in.Metadata.SubmittedAt.IsZero() {
-		return RunSpec{}, missing("Metadata.SubmittedAt")
+	if err := checkTimestamp(in.Metadata.SubmittedAt, "Metadata.SubmittedAt"); err != nil {
+		return RunSpec{}, err
 	}
 	c, err := verifyRevision(in.Revision)
 	if err != nil {
@@ -299,6 +302,19 @@ func cloneStrings(s []string) []string {
 
 func newError(code ps.Code, format string, args ...any) error {
 	return &ps.Error{Code: code, Msg: fmt.Sprintf(format, args...)}
+}
+
+// checkTimestamp fails closed on a zero timestamp or one that the wire
+// encoding (time.Time.MarshalJSON, RFC 3339) rejects: a year outside 0-9999
+// or a zone offset RFC 3339 cannot express.
+func checkTimestamp(t time.Time, field string) error {
+	if t.IsZero() {
+		return missing(field)
+	}
+	if _, err := t.MarshalJSON(); err != nil {
+		return newError(CodeInvalidFrozenInput, "frozen input %s is not RFC 3339 encodable: %v", field, err)
+	}
+	return nil
 }
 
 func missing(field string) error {

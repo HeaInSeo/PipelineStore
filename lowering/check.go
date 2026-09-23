@@ -21,8 +21,8 @@ func CheckSpec(s RunSpec) error {
 	if s.Run.RunID == "" {
 		return missing("run.runId")
 	}
-	if s.Run.SubmittedAt.IsZero() {
-		return missing("run.submittedAt")
+	if err := checkTimestamp(s.Run.SubmittedAt, "run.submittedAt"); err != nil {
+		return err
 	}
 	if s.Run.FailurePolicy.Mode != FailureModeFailFast {
 		return newError(ps.CodeInvalidContract, "run.failurePolicy.mode is %q, want %q", s.Run.FailurePolicy.Mode, FailureModeFailFast)
