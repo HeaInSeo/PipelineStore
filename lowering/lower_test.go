@@ -326,7 +326,7 @@ func TestLower_FailClosed(t *testing.T) {
 			in.Metadata.SubmittedAt = time.Date(2026, 1, 1, 0, 0, 0, 0, time.FixedZone("", 1))
 		}, lowering.CodeInvalidFrozenInput},
 		{"submittedAt negative sub-minute offset", func(in *lowering.Input) {
-			in.Metadata.SubmittedAt = time.Date(2026, 1, 1, 0, 0, 0, 0, time.FixedZone("", -(5*3600 + 30*60 + 45)))
+			in.Metadata.SubmittedAt = time.Date(2026, 1, 1, 0, 0, 0, 0, time.FixedZone("", -(5*3600+30*60+45)))
 		}, lowering.CodeInvalidFrozenInput},
 		{"empty revision id", func(in *lowering.Input) { in.Revision.RevisionID = "" }, lowering.CodeMissingFrozenInput},
 		{"empty pipeline id", func(in *lowering.Input) { in.Revision.PipelineID = "" }, lowering.CodeMissingFrozenInput},
