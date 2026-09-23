@@ -15,4 +15,19 @@
 // format. MemoryStore is the reference/test implementation of the atomic Store
 // contract and is not evidence of production durability; a durable adapter is
 // a separate storage gate.
+//
+// PIPE-I3 adds the automatic admission local core on the same Store: a
+// serialized per-policy lifecycle log (ACTIVATE/DISABLE/REENABLE/RETIRE) whose
+// activation entries carry the epoch's frontier, an admission gate
+// (Service.AdmitAutomatic) that records a new automatic intent only for an
+// ACTIVE policy, an occurrence class of exactly NEW, and a caller-provided
+// opaque PublicationPosition strictly after the frontier, and an owner-scoped
+// blocker set that holds materialization. Disable holds unassigned intents,
+// never cancels, and is not undone by re-enable. Publication order is never
+// inferred from time, events, delivery, or listing order; unknown or
+// incomparable facts are not admitted. Scope boundary (PIPE-I3): no Tori
+// adapter or wire format, no Run submit, Campaign, GC, or Authorization
+// provider, no multiple-policy conflict handling, and no submit-equality
+// authority (jumi.submit-intent.v1 is JUMI-owned). Service.CreateAutomatic
+// remains the ungated PIPE-I0 primitive and is not an automatic admission path.
 package intent

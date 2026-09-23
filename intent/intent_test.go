@@ -79,6 +79,9 @@ type storeState struct {
 	auto    map[autoKey]ID
 	ops     map[string]ID
 	runs    map[RunID]ID
+
+	policyLogs map[string][]PolicyTransition
+	policies   map[string]PolicyRecord
 }
 
 func snapshot(m *MemoryStore) storeState {
@@ -89,6 +92,9 @@ func snapshot(m *MemoryStore) storeState {
 		auto:    maps.Clone(m.auto),
 		ops:     maps.Clone(m.ops),
 		runs:    maps.Clone(m.runs),
+
+		policyLogs: maps.Clone(m.policyLogs),
+		policies:   maps.Clone(m.policies),
 	}
 }
 
@@ -634,7 +640,7 @@ func (mismatchedReader) GetRevision(_ context.Context, pipelineID string, _ ps.P
 
 func TestNoExternalServiceImports(t *testing.T) {
 	allowed := map[string]bool{}
-	for _, p := range []string{"context", "errors", "fmt", "sync", "github.com/google/uuid", "github.com/HeaInSeo/PipelineStore"} {
+	for _, p := range []string{"context", "errors", "fmt", "sort", "sync", "github.com/google/uuid", "github.com/HeaInSeo/PipelineStore"} {
 		allowed[p] = true
 	}
 	files, err := filepath.Glob("*.go")

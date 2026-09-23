@@ -29,6 +29,18 @@ const (
 	// CodeRunIDConflict is an attempt to attach a RunID different from the one
 	// already attached to the intent.
 	CodeRunIDConflict ps.Code = "RUN_ID_CONFLICT"
+	// CodePolicyRetired is a lifecycle transition on a retired AutoRunPolicyID.
+	// A retired ID is never reused.
+	CodePolicyRetired ps.Code = "POLICY_RETIRED"
+	// CodePolicyStale is a conditional write whose policy precondition (state,
+	// epoch or log sequence) no longer holds.
+	CodePolicyStale ps.Code = "POLICY_STALE"
+	// CodeFrontierInvalid is an activation frontier that is not comparable with,
+	// or is earlier than, the previous epoch's frontier.
+	CodeFrontierInvalid ps.Code = "FRONTIER_INVALID"
+	// CodeInvalidTransition is a lifecycle or blocker change not allowed from
+	// the current state.
+	CodeInvalidTransition ps.Code = "INVALID_TRANSITION"
 )
 
 // PipelineRevisionRef is the exact committed PipelineRevision coordinate issued
@@ -59,6 +71,15 @@ type Intent struct {
 
 	// RunID is empty until an externally assigned RunID is attached.
 	RunID RunID
+
+	// AdmissionEpoch is the ACTIVE policy epoch under which the admission gate
+	// recorded this automatic intent. It is zero for intents not created
+	// through Service.AdmitAutomatic.
+	AdmissionEpoch uint64
+
+	// Blockers is the owner-scoped materialization hold set. An intent is
+	// eligible for materialization only when every blocker is clear.
+	Blockers Blockers
 }
 
 // AutomaticRequest is one automatic evaluation of a policy against a subject.
