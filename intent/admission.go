@@ -2,7 +2,6 @@ package intent
 
 import (
 	"context"
-	"sort"
 
 	ps "github.com/HeaInSeo/PipelineStore"
 )
@@ -190,15 +189,24 @@ type AdmissionResult struct {
 	Result CreateResult
 }
 
-// LifecycleResult is the outcome of a disable or retire.
-type LifecycleResult struct {
-	Policy PolicyRecord
+// PolicyMembership is the lifecycle membership of a policy's automatic
+// intents. A Store captures it in the same serialized write or read as the
+// policy record it accompanies, so it never includes an intent admitted under
+// a later epoch than that record. Both lists are sorted.
+type PolicyMembership struct {
 	// Held lists the policy's intents that hold a POLICY_DISABLE blocker.
 	Held []ID
 	// RunIDAttached lists the policy's intents with a RunID and no
 	// POLICY_DISABLE blocker. Each must be reconciled by the same RunID and
 	// reported through RecordDisabledAcceptance; disable never cancels them.
 	RunIDAttached []ID
+}
+
+// LifecycleResult is the outcome of a disable or retire. Its membership is a
+// snapshot taken atomically with Policy.
+type LifecycleResult struct {
+	Policy PolicyRecord
+	PolicyMembership
 }
 
 // AcceptanceObservation is the caller's same-RunID reconcile result for an
@@ -278,7 +286,7 @@ func (s *Service) EnablePolicy(ctx context.Context, policyID string, frontier Pu
 				t = PolicyTransition{Kind: TransitionReenable, Epoch: rec.Epoch + 1, Frontier: frontier}
 			}
 		}
-		next, err := s.store.AppendPolicyTransition(ctx, policyID, rec.Seq, t, false)
+		next, _, err := s.store.AppendPolicyTransition(ctx, policyID, rec.Seq, t, false)
 		if ps.CodeOf(err) == CodePolicyStale {
 			continue
 		}
@@ -312,7 +320,9 @@ func (s *Service) stopPolicy(ctx context.Context, policyID string, kind Transiti
 		target = PolicyRetired
 	}
 	for range maxPolicyRetries {
-		rec, found, err := s.store.GetPolicy(ctx, policyID)
+		// The record and its membership are read together, so an idempotent
+		// repeat never reports intents admitted after a concurrent re-enable.
+		rec, members, found, err := s.store.GetPolicyMembership(ctx, policyID)
 		if err != nil {
 			return LifecycleResult{}, err
 		}
@@ -320,41 +330,22 @@ func (s *Service) stopPolicy(ctx context.Context, policyID string, kind Transiti
 			return LifecycleResult{}, newError(ps.CodeNotFound, "policy %q not found", policyID)
 		}
 		if rec.State == target {
-			return s.lifecycleResult(ctx, rec)
+			return LifecycleResult{Policy: rec, PolicyMembership: members}, nil
 		}
 		if rec.State == PolicyRetired {
 			return LifecycleResult{}, newError(CodePolicyRetired, "policy %q is retired", policyID)
 		}
 		t := PolicyTransition{Kind: kind, Epoch: rec.Epoch}
-		next, err := s.store.AppendPolicyTransition(ctx, policyID, rec.Seq, t, true)
+		next, members, err := s.store.AppendPolicyTransition(ctx, policyID, rec.Seq, t, true)
 		if ps.CodeOf(err) == CodePolicyStale {
 			continue
 		}
 		if err != nil {
 			return LifecycleResult{}, err
 		}
-		return s.lifecycleResult(ctx, next)
+		return LifecycleResult{Policy: next, PolicyMembership: members}, nil
 	}
 	return LifecycleResult{}, newError(CodePolicyStale, "policy %q changed concurrently on every attempt", policyID)
-}
-
-func (s *Service) lifecycleResult(ctx context.Context, rec PolicyRecord) (LifecycleResult, error) {
-	intents, err := s.store.ListAutomatic(ctx, rec.PolicyID)
-	if err != nil {
-		return LifecycleResult{}, err
-	}
-	res := LifecycleResult{Policy: rec}
-	for _, in := range intents {
-		switch {
-		case in.Blockers.PolicyDisable != BlockerClear:
-			res.Held = append(res.Held, in.ID)
-		case in.RunID != "":
-			res.RunIDAttached = append(res.RunIDAttached, in.ID)
-		}
-	}
-	sort.Slice(res.Held, func(i, j int) bool { return res.Held[i] < res.Held[j] })
-	sort.Slice(res.RunIDAttached, func(i, j int) bool { return res.RunIDAttached[i] < res.RunIDAttached[j] })
-	return res, nil
 }
 
 // AdmitAutomatic is the automatic admission gate. An existing intent for

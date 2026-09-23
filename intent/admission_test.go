@@ -565,6 +565,112 @@ func TestAdmission_D3_RetireHoldsLikeDisable(t *testing.T) {
 	assertEligible(t, svc, id, false)
 }
 
+// raceStore runs after once, right after the first call to the named method
+// returns and before the Service sees the result. It places a concurrent
+// writer deterministically in the window between the store call and the
+// result the Service builds from it.
+type raceStore struct {
+	*MemoryStore
+	method string
+	after  func()
+	once   sync.Once
+}
+
+func (r *raceStore) fire(method string) {
+	if method == r.method {
+		r.once.Do(r.after)
+	}
+}
+
+func (r *raceStore) AppendPolicyTransition(ctx context.Context, policyID string, expectedSeq uint64, t PolicyTransition, holdUnassigned bool) (PolicyRecord, PolicyMembership, error) {
+	rec, members, err := r.MemoryStore.AppendPolicyTransition(ctx, policyID, expectedSeq, t, holdUnassigned)
+	if err == nil && t.Kind == TransitionDisable {
+		r.fire("AppendPolicyTransition")
+	}
+	return rec, members, err
+}
+
+func (r *raceStore) GetPolicyMembership(ctx context.Context, policyID string) (PolicyRecord, PolicyMembership, bool, error) {
+	rec, members, found, err := r.MemoryStore.GetPolicyMembership(ctx, policyID)
+	if err == nil && found && rec.State == PolicyDisabled {
+		r.fire("GetPolicyMembership")
+	}
+	return rec, members, found, err
+}
+
+// TestAdmission_D3_DisableMembershipIsTransitionSnapshot: a re-enable, an
+// epoch-2 admission and its RunID attach that land after the DISABLE write
+// but before the result is built must not appear in that disable's result.
+func TestAdmission_D3_DisableMembershipIsTransitionSnapshot(t *testing.T) {
+	for _, method := range []string{"AppendPolicyTransition", "GetPolicyMembership"} {
+		t.Run(method, func(t *testing.T) {
+			ctx := context.Background()
+			policy := autoReq().AutoRunPolicyID
+			race := &raceStore{MemoryStore: NewMemoryStore(), method: "none"}
+			svc, err := NewService(race, newCommitted(rev1, rev2))
+			if err != nil {
+				t.Fatalf("NewService: %v", err)
+			}
+			// other is the concurrent writer: same store, no hook.
+			other, err := NewService(race.MemoryStore, newCommitted(rev1, rev2))
+			if err != nil {
+				t.Fatalf("NewService: %v", err)
+			}
+
+			mustEnable(t, svc, 10)
+			held := mustAdmit(t, svc, subjectReq("held-e1"), newAt(11), Admitted).Result.Intent.ID
+			attached := mustAdmit(t, svc, subjectReq("attached-e1"), newAt(12), Admitted).Result.Intent.ID
+			if _, err := svc.AttachRunID(ctx, attached, "run-e1"); err != nil {
+				t.Fatalf("AttachRunID: %v", err)
+			}
+
+			var late ID
+			race.after = func() {
+				mustEnable(t, other, 20)
+				late = mustAdmit(t, other, subjectReq("late-e2"), newAt(21), Admitted).Result.Intent.ID
+				if _, err := other.AttachRunID(ctx, late, "run-e2"); err != nil {
+					t.Errorf("AttachRunID(late): %v", err)
+				}
+			}
+			var res LifecycleResult
+			if method == "AppendPolicyTransition" {
+				race.method = method
+				res, err = svc.DisablePolicy(ctx, policy)
+			} else {
+				// The idempotent repeat reads the DISABLED record and its
+				// membership; the race fires right after that read.
+				if _, err := svc.DisablePolicy(ctx, policy); err != nil {
+					t.Fatalf("DisablePolicy: %v", err)
+				}
+				race.method = method
+				res, err = svc.DisablePolicy(ctx, policy)
+			}
+			if err != nil {
+				t.Fatalf("DisablePolicy: %v", err)
+			}
+			if late == "" {
+				t.Fatal("race hook did not run")
+			}
+
+			if res.Policy.State != PolicyDisabled || res.Policy.Epoch != 1 {
+				t.Fatalf("Policy = %+v, want DISABLED at epoch 1", res.Policy)
+			}
+			if !reflect.DeepEqual(res.Held, []ID{held}) {
+				t.Errorf("Held = %v, want [%s]", res.Held, held)
+			}
+			if !reflect.DeepEqual(res.RunIDAttached, []ID{attached}) {
+				t.Errorf("RunIDAttached = %v, want [%s] (epoch-2 intent %s must not be reported)",
+					res.RunIDAttached, attached, late)
+			}
+			// The epoch-2 intent was never subject to the disable.
+			assertEligible(t, svc, late, true)
+			if rec, _, _ := svc.Policy(ctx, policy); rec.State != PolicyActive || rec.Epoch != 2 {
+				t.Fatalf("policy after race = %+v, want ACTIVE at epoch 2", rec)
+			}
+		})
+	}
+}
+
 // ── validation / fail-closed inputs ─────────────────────────────────────────
 
 func TestAdmission_InvalidInputs_FailClosedZeroMutation(t *testing.T) {

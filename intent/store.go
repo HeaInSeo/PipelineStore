@@ -2,6 +2,7 @@ package intent
 
 import (
 	"context"
+	"slices"
 	"sync"
 
 	"github.com/google/uuid"
@@ -45,20 +46,23 @@ type Store interface {
 	GetPolicy(ctx context.Context, policyID string) (rec PolicyRecord, found bool, err error)
 	// PolicyLog returns a copy of policyID's lifecycle log in order.
 	PolicyLog(ctx context.Context, policyID string) ([]PolicyTransition, error)
+	// GetPolicyMembership returns GetPolicy's result together with the
+	// policy's lifecycle membership, both read in one serialized read.
+	GetPolicyMembership(ctx context.Context, policyID string) (rec PolicyRecord, members PolicyMembership, found bool, err error)
 	// AppendPolicyTransition appends t to policyID's log only if the log's
 	// current length is expectedSeq, else fails with CodePolicyStale and
 	// changes nothing. t.Seq is assigned by the store. When holdUnassigned is
 	// set, every automatic intent of the policy without a RunID gets a
-	// POLICY_DISABLE blocker in the same atomic write.
-	AppendPolicyTransition(ctx context.Context, policyID string, expectedSeq uint64, t PolicyTransition, holdUnassigned bool) (PolicyRecord, error)
+	// POLICY_DISABLE blocker in the same atomic write, and the returned
+	// membership is captured in that write, after the holds; otherwise it is
+	// empty.
+	AppendPolicyTransition(ctx context.Context, policyID string, expectedSeq uint64, t PolicyTransition, holdUnassigned bool) (PolicyRecord, PolicyMembership, error)
 	// CreateAutomaticAdmitted behaves as CreateAutomatic when an intent already
 	// exists for the draft's automatic uniqueness domain. Otherwise it records
 	// the draft only if the draft's policy is ACTIVE at epoch, and fails with
 	// CodePolicyStale, changing nothing, if it is not. The policy check and the
 	// create are one serialized write.
 	CreateAutomaticAdmitted(ctx context.Context, draft Intent, epoch uint64) (stored Intent, created bool, err error)
-	// ListAutomatic returns the automatic intents recorded for policyID.
-	ListAutomatic(ctx context.Context, policyID string) ([]Intent, error)
 	// UpdateBlocker sets owner's blocker on the intent to state (BlockerClear
 	// releases it) and leaves every other owner's blocker unchanged. An unknown
 	// id fails with ps.CodeNotFound.
@@ -300,10 +304,46 @@ func (m *MemoryStore) PolicyLog(ctx context.Context, policyID string) ([]PolicyT
 	return append([]PolicyTransition(nil), m.policyLogs[policyID]...), nil
 }
 
-// AppendPolicyTransition implements Store.
-func (m *MemoryStore) AppendPolicyTransition(ctx context.Context, policyID string, expectedSeq uint64, t PolicyTransition, holdUnassigned bool) (PolicyRecord, error) {
+// GetPolicyMembership implements Store.
+func (m *MemoryStore) GetPolicyMembership(ctx context.Context, policyID string) (PolicyRecord, PolicyMembership, bool, error) {
 	if err := ctx.Err(); err != nil {
-		return PolicyRecord{}, err
+		return PolicyRecord{}, PolicyMembership{}, false, err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	rec, ok := m.policies[policyID]
+	if !ok {
+		return PolicyRecord{}, PolicyMembership{}, false, nil
+	}
+	return rec, m.membershipLocked(policyID), true, nil
+}
+
+// membershipLocked classifies policyID's automatic intents. m.mu must be held.
+func (m *MemoryStore) membershipLocked(policyID string) PolicyMembership {
+	var out PolicyMembership
+	for key, id := range m.auto {
+		if key.policyID != policyID {
+			continue
+		}
+		in := m.intents[id]
+		switch {
+		case in.Blockers.PolicyDisable != BlockerClear:
+			out.Held = append(out.Held, id)
+		case in.RunID != "":
+			out.RunIDAttached = append(out.RunIDAttached, id)
+		}
+	}
+	slices.Sort(out.Held)
+	slices.Sort(out.RunIDAttached)
+	return out
+}
+
+// AppendPolicyTransition implements Store.
+func (m *MemoryStore) AppendPolicyTransition(ctx context.Context, policyID string, expectedSeq uint64, t PolicyTransition, holdUnassigned bool) (PolicyRecord, PolicyMembership, error) {
+	if err := ctx.Err(); err != nil {
+		return PolicyRecord{}, PolicyMembership{}, err
 	}
 
 	m.mu.Lock()
@@ -311,7 +351,7 @@ func (m *MemoryStore) AppendPolicyTransition(ctx context.Context, policyID strin
 
 	log := m.policyLogs[policyID]
 	if uint64(len(log)) != expectedSeq {
-		return PolicyRecord{}, newError(CodePolicyStale,
+		return PolicyRecord{}, PolicyMembership{}, newError(CodePolicyStale,
 			"policy %q log length is %d, expected %d", policyID, len(log), expectedSeq)
 	}
 	t.Seq = expectedSeq + 1
@@ -327,11 +367,11 @@ func (m *MemoryStore) AppendPolicyTransition(ctx context.Context, policyID strin
 		}
 	}
 	if err := m.inject(stepPolicyStaged); err != nil {
-		return PolicyRecord{}, err
+		return PolicyRecord{}, PolicyMembership{}, err
 	}
 	if holdUnassigned {
 		if err := m.inject(stepHoldStaged); err != nil {
-			return PolicyRecord{}, err
+			return PolicyRecord{}, PolicyMembership{}, err
 		}
 	}
 	m.policyLogs[policyID] = append(log[:len(log):len(log)], t)
@@ -341,7 +381,11 @@ func (m *MemoryStore) AppendPolicyTransition(ctx context.Context, policyID strin
 		in.Blockers.PolicyDisable = BlockerBlocked
 		m.intents[id] = in
 	}
-	return next, nil
+	var members PolicyMembership
+	if holdUnassigned {
+		members = m.membershipLocked(policyID)
+	}
+	return next, members, nil
 }
 
 // CreateAutomaticAdmitted implements Store.
@@ -376,24 +420,6 @@ func (m *MemoryStore) CreateAutomaticAdmitted(ctx context.Context, draft Intent,
 	m.auto[key] = id
 	m.intents[id] = draft
 	return draft, true, nil
-}
-
-// ListAutomatic implements Store.
-func (m *MemoryStore) ListAutomatic(ctx context.Context, policyID string) ([]Intent, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	var out []Intent
-	for key, id := range m.auto {
-		if key.policyID == policyID {
-			out = append(out, m.intents[id])
-		}
-	}
-	return out, nil
 }
 
 // UpdateBlocker implements Store.
