@@ -78,12 +78,18 @@ type storeState struct {
 	intents map[ID]Intent
 	auto    map[autoKey]ID
 	ops     map[string]ID
+	runs    map[RunID]ID
 }
 
 func snapshot(m *MemoryStore) storeState {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return storeState{intents: maps.Clone(m.intents), auto: maps.Clone(m.auto), ops: maps.Clone(m.ops)}
+	return storeState{
+		intents: maps.Clone(m.intents),
+		auto:    maps.Clone(m.auto),
+		ops:     maps.Clone(m.ops),
+		runs:    maps.Clone(m.runs),
+	}
 }
 
 func assertUnchanged(t *testing.T, m *MemoryStore, before storeState) {
@@ -309,6 +315,185 @@ func TestAttachRunID_SameConverges_DifferentConflicts(t *testing.T) {
 	assertCode(t, err, ps.CodeNotFound)
 }
 
+// ── 6b. RunID reverse uniqueness (DQ-R2.1-P1) ────────────────────────────────
+
+func TestAttachRunID_RunIDOwnedByAnotherIntent_ConflictZeroMutation(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+
+	a, err := svc.CreateAutomatic(ctx, autoReq())
+	if err != nil {
+		t.Fatalf("create A: %v", err)
+	}
+	other := autoReq()
+	other.InputBindingSubjectIdentity = "subject-2"
+	b, err := svc.CreateAutomatic(ctx, other)
+	if err != nil {
+		t.Fatalf("create B: %v", err)
+	}
+	if _, err := svc.AttachRunID(ctx, a.Intent.ID, "run-A"); err != nil {
+		t.Fatalf("attach run-A to A: %v", err)
+	}
+	before := snapshot(store)
+
+	_, err = svc.AttachRunID(ctx, b.Intent.ID, "run-A")
+	assertCode(t, err, CodeRunIDConflict)
+	assertUnchanged(t, store, before)
+}
+
+func TestAttachRunID_ConcurrentSameRunID_ExactlyOneOwner(t *testing.T) {
+	svc, store := newTestService(t)
+	ctx := context.Background()
+
+	var ids []ID
+	for i := range 50 {
+		req := autoReq()
+		req.InputBindingSubjectIdentity = "subject-" + strconv.Itoa(i)
+		res, err := svc.CreateAutomatic(ctx, req)
+		if err != nil {
+			t.Fatalf("create %d: %v", i, err)
+		}
+		ids = append(ids, res.Intent.ID)
+	}
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	winners := 0
+	for _, id := range ids {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := svc.AttachRunID(ctx, id, "run-shared")
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				winners++
+			case ps.CodeOf(err) != CodeRunIDConflict:
+				t.Errorf("attach %s: unexpected error %v", id, err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	st := snapshot(store)
+	holders := 0
+	for _, in := range st.intents {
+		if in.RunID == "run-shared" {
+			holders++
+		}
+	}
+	if winners != 1 || holders != 1 || len(st.runs) != 1 {
+		t.Fatalf("winners=%d holders=%d run-index=%d, want 1/1/1", winners, holders, len(st.runs))
+	}
+}
+
+func TestAttachRunID_FaultInjection_NoPartialState(t *testing.T) {
+	injected := errors.New("injected crash")
+	for _, step := range []string{stepRunIndexStaged, stepIntentStaged} {
+		t.Run(step, func(t *testing.T) {
+			svc, store := newTestService(t)
+			ctx := context.Background()
+			res, err := svc.CreateAutomatic(ctx, autoReq())
+			if err != nil {
+				t.Fatalf("CreateAutomatic: %v", err)
+			}
+			before := snapshot(store)
+
+			store.fault = func(s string) error {
+				if s == step {
+					return injected
+				}
+				return nil
+			}
+			if _, err := svc.AttachRunID(ctx, res.Intent.ID, "run-A"); !errors.Is(err, injected) {
+				t.Fatalf("attach err = %v, want injected failure", err)
+			}
+			assertUnchanged(t, store, before)
+
+			store.fault = nil
+			got, err := svc.AttachRunID(ctx, res.Intent.ID, "run-A")
+			if err != nil || got.RunID != "run-A" {
+				t.Fatalf("retry after fault: got=%+v err=%v", got, err)
+			}
+		})
+	}
+}
+
+// ── Codex P2: replay resolved before the revision read ───────────────────────
+
+// flakyReader serves exact reads until switched off, then fails every read.
+type flakyReader struct {
+	mu   sync.Mutex
+	down bool
+	next RevisionReader
+}
+
+func (f *flakyReader) GetRevision(ctx context.Context, pipelineID string, revisionID ps.PipelineRevisionID) (*ps.PipelineRevision, error) {
+	f.mu.Lock()
+	down := f.down
+	f.mu.Unlock()
+	if down {
+		return nil, errors.New("revision reader unavailable")
+	}
+	return f.next.GetRevision(ctx, pipelineID, revisionID)
+}
+
+func TestReplay_DoesNotDependOnRevisionReader(t *testing.T) {
+	reader := &flakyReader{next: newCommitted(rev1, rev2)}
+	store := NewMemoryStore()
+	svc, err := NewService(store, reader)
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	ctx := context.Background()
+
+	auto, err := svc.CreateAutomatic(ctx, autoReq())
+	if err != nil {
+		t.Fatalf("CreateAutomatic: %v", err)
+	}
+	expl, err := svc.CreateExplicit(ctx, explicitReq())
+	if err != nil {
+		t.Fatalf("CreateExplicit: %v", err)
+	}
+	before := snapshot(store)
+
+	reader.mu.Lock()
+	reader.down = true
+	reader.mu.Unlock()
+
+	if res, err := svc.CreateAutomatic(ctx, autoReq()); err != nil || res.Created || res.Intent != auto.Intent {
+		t.Fatalf("automatic replay with reader down: res=%+v err=%v, want the existing intent", res, err)
+	}
+	if res, err := svc.CreateExplicit(ctx, explicitReq()); err != nil || res.Created || res.Intent != expl.Intent {
+		t.Fatalf("explicit replay with reader down: res=%+v err=%v, want the existing intent", res, err)
+	}
+
+	// Changed semantics naming an uncommitted revision is still the documented
+	// OPERATION_CONFLICT, not NOT_FOUND or a reader error.
+	changed := explicitReq()
+	changed.PipelineRevision = PipelineRevisionRef{PipelineID: "pipe-a", RevisionID: "rev-never-committed"}
+	_, err = svc.CreateExplicit(ctx, changed)
+	assertCode(t, err, ps.CodeOperationConflict)
+
+	// An automatic replay observing an uncommitted revision returns the frozen
+	// intent with a divergence rather than failing the read.
+	diverged := autoReq()
+	diverged.PipelineRevision = PipelineRevisionRef{PipelineID: "pipe-a", RevisionID: "rev-never-committed"}
+	res, err := svc.CreateAutomatic(ctx, diverged)
+	if err != nil || res.Created || res.Intent != auto.Intent || res.Divergence == nil || !res.Divergence.PipelineRevisionChanged {
+		t.Fatalf("automatic replay on uncommitted revision: res=%+v err=%v", res, err)
+	}
+
+	// A genuinely new intent still requires the exact revision read.
+	fresh := autoReq()
+	fresh.InputBindingSubjectIdentity = "subject-new"
+	if _, err := svc.CreateAutomatic(ctx, fresh); err == nil {
+		t.Fatal("new intent created while the revision reader is down")
+	}
+	assertUnchanged(t, store, before)
+}
+
 // ── 7. failure between ledger/index and intent exposes neither ───────────────
 
 func TestMemoryStore_FaultInjection_NoPartialState(t *testing.T) {
@@ -436,7 +621,7 @@ func TestRequireCommitted_RejectsMismatchedRead(t *testing.T) {
 	}
 	_, err = svc.CreateAutomatic(context.Background(), autoReq())
 	assertCode(t, err, ps.CodeNotFound)
-	assertUnchanged(t, store, storeState{intents: map[ID]Intent{}, auto: map[autoKey]ID{}, ops: map[string]ID{}})
+	assertUnchanged(t, store, storeState{intents: map[ID]Intent{}, auto: map[autoKey]ID{}, ops: map[string]ID{}, runs: map[RunID]ID{}})
 }
 
 type mismatchedReader struct{}

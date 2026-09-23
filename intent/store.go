@@ -14,6 +14,12 @@ import (
 // failure at any point leaves either all of a call's writes or none of them.
 // Stored intents are immutable except for the one-time RunID attach.
 type Store interface {
+	// LookupAutomatic returns the intent recorded for the automatic uniqueness
+	// domain (policyID, subject), with found=false when there is none.
+	LookupAutomatic(ctx context.Context, policyID, subject string) (stored Intent, found bool, err error)
+	// LookupExplicit returns the intent recorded for operationID, with
+	// found=false when there is none.
+	LookupExplicit(ctx context.Context, operationID string) (stored Intent, found bool, err error)
 	// CreateAutomatic returns the intent already recorded for the draft's
 	// automatic uniqueness domain (AutoRunPolicyID, InputBindingSubjectIdentity)
 	// with created=false, or records the draft under a newly allocated ID
@@ -26,9 +32,10 @@ type Store interface {
 	// modified; comparing its semantics with the draft is the caller's job.
 	CreateExplicit(ctx context.Context, draft Intent) (stored Intent, created bool, err error)
 	// AttachRunID attaches run to the intent. Attaching the RunID that is
-	// already attached is a no-op; attaching a different one fails with
-	// CodeRunIDConflict and leaves the intent unchanged. An unknown id fails with
-	// ps.CodeNotFound.
+	// already attached is a no-op. Attaching a different RunID, or a RunID
+	// already attached to another intent in this store, fails with
+	// CodeRunIDConflict and changes nothing; the RunID-to-intent index and the
+	// intent are written together. An unknown id fails with ps.CodeNotFound.
 	AttachRunID(ctx context.Context, id ID, run RunID) (Intent, error)
 	// Get returns the intent by exact id, or ps.CodeNotFound.
 	Get(ctx context.Context, id ID) (Intent, error)
@@ -38,9 +45,10 @@ type Store interface {
 // before the call's writes become visible. A durable Store's crash window sits
 // at the same points.
 const (
-	stepIndexStaged  = "auto-index-staged"
-	stepLedgerStaged = "operation-ledger-staged"
-	stepIntentStaged = "intent-staged"
+	stepIndexStaged    = "auto-index-staged"
+	stepLedgerStaged   = "operation-ledger-staged"
+	stepRunIndexStaged = "run-index-staged"
+	stepIntentStaged   = "intent-staged"
 )
 
 type autoKey struct {
@@ -57,6 +65,7 @@ type MemoryStore struct {
 	intents map[ID]Intent
 	auto    map[autoKey]ID
 	ops     map[string]ID
+	runs    map[RunID]ID
 
 	// fault, when set by tests, is called at each staged step of a write and
 	// aborts the write when it returns an error.
@@ -71,7 +80,40 @@ func NewMemoryStore() *MemoryStore {
 		intents: map[ID]Intent{},
 		auto:    map[autoKey]ID{},
 		ops:     map[string]ID{},
+		runs:    map[RunID]ID{},
 	}
+}
+
+// LookupAutomatic implements Store.
+func (m *MemoryStore) LookupAutomatic(ctx context.Context, policyID, subject string) (Intent, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return Intent{}, false, err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	id, ok := m.auto[autoKey{policyID: policyID, subject: subject}]
+	if !ok {
+		return Intent{}, false, nil
+	}
+	return m.intents[id], true, nil
+}
+
+// LookupExplicit implements Store.
+func (m *MemoryStore) LookupExplicit(ctx context.Context, operationID string) (Intent, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return Intent{}, false, err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	id, ok := m.ops[operationID]
+	if !ok {
+		return Intent{}, false, nil
+	}
+	return m.intents[id], true, nil
 }
 
 func (m *MemoryStore) inject(step string) error {
@@ -163,16 +205,25 @@ func (m *MemoryStore) AttachRunID(ctx context.Context, id ID, run RunID) (Intent
 	if !ok {
 		return Intent{}, newError(ps.CodeNotFound, "intent %q not found", id)
 	}
-	switch in.RunID {
-	case run:
+	if in.RunID == run {
 		return in, nil
-	case "":
-		in.RunID = run
-		m.intents[id] = in
-		return in, nil
-	default:
+	}
+	if in.RunID != "" {
 		return Intent{}, newError(CodeRunIDConflict, "intent %q already has RunID %q; refusing %q", id, in.RunID, run)
 	}
+	if owner, taken := m.runs[run]; taken {
+		return Intent{}, newError(CodeRunIDConflict, "RunID %q is already attached to intent %q; refusing intent %q", run, owner, id)
+	}
+	if err := m.inject(stepRunIndexStaged); err != nil {
+		return Intent{}, err
+	}
+	if err := m.inject(stepIntentStaged); err != nil {
+		return Intent{}, err
+	}
+	in.RunID = run
+	m.runs[run] = id
+	m.intents[id] = in
+	return in, nil
 }
 
 // Get implements Store.

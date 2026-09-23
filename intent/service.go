@@ -53,9 +53,20 @@ func (s *Service) requireCommitted(ctx context.Context, ref PipelineRevisionRef)
 // already recorded. A replay never creates a second intent and never rewrites
 // the frozen policy or pipeline revision; a replay that observed different
 // revisions is reported through CreateResult.Divergence.
+//
+// A replay is resolved from the store before the revision read, so it neither
+// depends on the revision reader being available nor on the observed revision
+// being committed; only a call that may create an intent reads the revision.
 func (s *Service) CreateAutomatic(ctx context.Context, req AutomaticRequest) (CreateResult, error) {
 	if err := req.validate(); err != nil {
 		return CreateResult{}, err
+	}
+	existing, found, err := s.store.LookupAutomatic(ctx, req.AutoRunPolicyID, req.InputBindingSubjectIdentity)
+	if err != nil {
+		return CreateResult{}, err
+	}
+	if found {
+		return automaticReplay(existing, req), nil
 	}
 	if err := s.requireCommitted(ctx, req.PipelineRevision); err != nil {
 		return CreateResult{}, err
@@ -70,30 +81,36 @@ func (s *Service) CreateAutomatic(ctx context.Context, req AutomaticRequest) (Cr
 	if err != nil {
 		return CreateResult{}, err
 	}
-	res := CreateResult{Intent: stored, Created: created}
 	if !created {
-		d := Divergence{
-			PolicyRevisionChanged:    stored.AutoRunPolicyRevision != req.AutoRunPolicyRevision,
-			PipelineRevisionChanged:  stored.PipelineRevision != req.PipelineRevision,
-			ObservedPolicyRevision:   req.AutoRunPolicyRevision,
-			ObservedPipelineRevision: req.PipelineRevision,
-		}
-		if d.PolicyRevisionChanged || d.PipelineRevisionChanged {
-			res.Divergence = &d
-		}
+		// Lost a race to a concurrent creator after the lookup.
+		return automaticReplay(stored, req), nil
 	}
-	return res, nil
+	return CreateResult{Intent: stored, Created: true}, nil
+}
+
+// automaticReplay returns the frozen intent for a reevaluation of its domain,
+// reporting any revision the reevaluation observed that differs from it.
+func automaticReplay(stored Intent, req AutomaticRequest) CreateResult {
+	res := CreateResult{Intent: stored}
+	d := Divergence{
+		PolicyRevisionChanged:    stored.AutoRunPolicyRevision != req.AutoRunPolicyRevision,
+		PipelineRevisionChanged:  stored.PipelineRevision != req.PipelineRevision,
+		ObservedPolicyRevision:   req.AutoRunPolicyRevision,
+		ObservedPipelineRevision: req.PipelineRevision,
+	}
+	if d.PolicyRevisionChanged || d.PipelineRevisionChanged {
+		res.Divergence = &d
+	}
+	return res
 }
 
 // CreateExplicit records the explicit intent for the request's OperationID, or
 // returns the one already recorded when the semantics match. The same
 // OperationID with different semantics fails with ps.CodeOperationConflict and
-// writes nothing.
+// writes nothing. As with CreateAutomatic, an existing OperationID is resolved
+// before the revision read.
 func (s *Service) CreateExplicit(ctx context.Context, req ExplicitRequest) (CreateResult, error) {
 	if err := req.validate(); err != nil {
-		return CreateResult{}, err
-	}
-	if err := s.requireCommitted(ctx, req.PipelineRevision); err != nil {
 		return CreateResult{}, err
 	}
 	draft := Intent{
@@ -102,20 +119,40 @@ func (s *Service) CreateExplicit(ctx context.Context, req ExplicitRequest) (Crea
 		InputBindingSubjectIdentity: req.InputBindingSubjectIdentity,
 		PipelineRevision:            req.PipelineRevision,
 	}
+	existing, found, err := s.store.LookupExplicit(ctx, req.OperationID)
+	if err != nil {
+		return CreateResult{}, err
+	}
+	if found {
+		return explicitReplay(existing, draft)
+	}
+	if err := s.requireCommitted(ctx, req.PipelineRevision); err != nil {
+		return CreateResult{}, err
+	}
 	stored, created, err := s.store.CreateExplicit(ctx, draft)
 	if err != nil {
 		return CreateResult{}, err
 	}
-	if !created && !sameExplicitSemantics(stored, draft) {
-		return CreateResult{}, newError(ps.CodeOperationConflict,
-			"operation %q is already bound to intent %q with different semantics", req.OperationID, stored.ID)
+	if !created {
+		// Lost a race to a concurrent creator after the lookup.
+		return explicitReplay(stored, draft)
 	}
-	return CreateResult{Intent: stored, Created: created}, nil
+	return CreateResult{Intent: stored, Created: true}, nil
+}
+
+// explicitReplay converges on the intent already bound to the draft's
+// OperationID, or fails with ps.CodeOperationConflict if its semantics differ.
+func explicitReplay(stored, draft Intent) (CreateResult, error) {
+	if !sameExplicitSemantics(stored, draft) {
+		return CreateResult{}, newError(ps.CodeOperationConflict,
+			"operation %q is already bound to intent %q with different semantics", draft.OperationID, stored.ID)
+	}
+	return CreateResult{Intent: stored}, nil
 }
 
 // AttachRunID attaches an externally assigned RunID to an existing intent.
-// Re-attaching the same RunID converges; a different RunID fails with
-// CodeRunIDConflict and leaves the existing assignment unchanged.
+// Re-attaching the same RunID converges. A different RunID, or a RunID already
+// attached to another intent, fails with CodeRunIDConflict and changes nothing.
 func (s *Service) AttachRunID(ctx context.Context, id ID, run RunID) (Intent, error) {
 	if id == "" {
 		return Intent{}, missing("intent ID")
