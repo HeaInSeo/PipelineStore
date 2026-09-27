@@ -388,7 +388,7 @@ func (s *Service) AdmitAutomatic(ctx context.Context, req AutomaticRequest, fact
 			}
 			revisionChecked = true
 		}
-		stored, created, err := s.store.CreateAutomaticAdmitted(ctx, Intent{
+		stored, created, err := s.store.createAutomaticAdmitted(ctx, Intent{
 			Origin:                      OriginAutomatic,
 			AutoRunPolicyID:             req.AutoRunPolicyID,
 			AutoRunPolicyRevision:       req.AutoRunPolicyRevision,

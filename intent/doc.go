@@ -30,6 +30,7 @@
 // provider, no multiple-policy conflict handling, and no submit-equality
 // authority (jumi.submit-intent.v1 is JUMI-owned). Service.AdmitAutomatic is
 // the only public way to record an automatic intent; the ungated PIPE-I0
-// primitive is internal to this package (Store.CreateAutomatic stays the
-// internal store contract).
+// primitive and the raw automatic store writes (Store.createAutomatic,
+// Store.createAutomaticAdmitted) are unexported, so a Store is implementable
+// only inside this package.
 package intent

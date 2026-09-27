@@ -4,29 +4,128 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"go/types"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
 	ps "github.com/HeaInSeo/PipelineStore"
 )
 
-// AdmitAutomatic is the only exported Service method that accepts an
-// AutomaticRequest: no public path records an automatic intent without the
-// admission gate.
-func TestAdmission_OnlyPublicAutomaticPathIsAdmitAutomatic(t *testing.T) {
+// consumerAutomaticMethods is every method a consumer can call on a value of
+// the package's exported Service/Store/MemoryStore types whose name mentions
+// automatic intents. Only the admission gate and the read-only lookup may be
+// reachable; a raw automatic write would bypass admission.
+var consumerAutomaticMethods = map[string]bool{
+	"AdmitAutomatic":  true,
+	"LookupAutomatic": true,
+}
+
+// No value a consumer can obtain (Service, the Store interface, or the
+// MemoryStore reference implementation) exposes a method that records an
+// automatic intent outside Service.AdmitAutomatic.
+func TestAdmission_ConsumerMethodSetsExposeNoRawAutomaticWrite(t *testing.T) {
 	reqType := reflect.TypeOf(AutomaticRequest{})
-	svcType := reflect.TypeOf(&Service{})
-	for i := 0; i < svcType.NumMethod(); i++ {
-		m := svcType.Method(i)
-		for j := 1; j < m.Type.NumIn(); j++ {
-			if m.Type.In(j) == reqType && m.Name != "AdmitAutomatic" {
-				t.Errorf("exported Service.%s takes an AutomaticRequest outside the admission gate", m.Name)
+	consumerTypes := []reflect.Type{
+		reflect.TypeOf(&Service{}),
+		reflect.TypeOf((*Store)(nil)).Elem(),
+		reflect.TypeOf(NewMemoryStore()),
+	}
+	for _, typ := range consumerTypes {
+		for i := 0; i < typ.NumMethod(); i++ {
+			m := typ.Method(i)
+			if !m.IsExported() {
+				// An interface's method set lists unexported methods too; a
+				// consumer outside the package cannot call them.
+				continue
+			}
+			if strings.Contains(m.Name, "Automatic") && !consumerAutomaticMethods[m.Name] {
+				t.Errorf("exported %v.%s reaches automatic intent state outside the admission gate", typ, m.Name)
+			}
+			for j := 0; j < m.Type.NumIn(); j++ {
+				if m.Type.In(j) == reqType && m.Name != "AdmitAutomatic" {
+					t.Errorf("exported %v.%s takes an AutomaticRequest outside the admission gate", typ, m.Name)
+				}
 			}
 		}
 	}
-	if _, ok := svcType.MethodByName("AdmitAutomatic"); !ok {
+	if _, ok := reflect.TypeOf(&Service{}).MethodByName("AdmitAutomatic"); !ok {
 		t.Fatal("Service.AdmitAutomatic missing")
+	}
+}
+
+// The same invariant over the package's full exported API as written in
+// source: every exported function, every exported method on any type, and
+// every exported method of any interface. Reflection cannot enumerate
+// package-level functions, so the non-test sources are parsed.
+func TestAdmission_FullExportedAPIHasNoRawAutomaticWrite(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	checked := 0
+	check := func(owner, name string, params *ast.FieldList) {
+		checked++
+		if strings.Contains(name, "Automatic") && !consumerAutomaticMethods[name] {
+			t.Errorf("exported %s%s reaches automatic intent state outside the admission gate", owner, name)
+		}
+		for _, p := range params.List {
+			if id, ok := p.Type.(*ast.Ident); ok && id.Name == "AutomaticRequest" && name != "AdmitAutomatic" {
+				t.Errorf("exported %s%s takes an AutomaticRequest outside the admission gate", owner, name)
+			}
+		}
+	}
+	for _, path := range files {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, decl := range f.Decls {
+			switch d := decl.(type) {
+			case *ast.FuncDecl:
+				if d.Name.IsExported() {
+					owner := ""
+					if d.Recv != nil && len(d.Recv.List) > 0 {
+						owner = types.ExprString(d.Recv.List[0].Type) + "."
+					}
+					check(owner, d.Name.Name, d.Type.Params)
+				}
+			case *ast.GenDecl:
+				for _, spec := range d.Specs {
+					ts, ok := spec.(*ast.TypeSpec)
+					if !ok {
+						continue
+					}
+					it, ok := ts.Type.(*ast.InterfaceType)
+					if !ok || !ts.Name.IsExported() {
+						continue
+					}
+					for _, m := range it.Methods.List {
+						ft, ok := m.Type.(*ast.FuncType)
+						if !ok {
+							continue
+						}
+						for _, n := range m.Names {
+							if n.IsExported() {
+								check(ts.Name.Name+".", n.Name, ft.Params)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no exported API found; the source scan is broken")
 	}
 }
 

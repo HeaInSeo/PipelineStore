@@ -73,7 +73,7 @@ func (s *Service) createAutomatic(ctx context.Context, req AutomaticRequest) (Cr
 	if err := s.requireCommitted(ctx, req.PipelineRevision); err != nil {
 		return CreateResult{}, err
 	}
-	stored, created, err := s.store.CreateAutomatic(ctx, Intent{
+	stored, created, err := s.store.createAutomatic(ctx, Intent{
 		Origin:                      OriginAutomatic,
 		AutoRunPolicyID:             req.AutoRunPolicyID,
 		AutoRunPolicyRevision:       req.AutoRunPolicyRevision,

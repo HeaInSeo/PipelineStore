@@ -14,6 +14,12 @@ import (
 // implementation must make each method's writes crash-safe and atomic: a
 // failure at any point leaves either all of a call's writes or none of them.
 // Stored intents are immutable except for the one-time RunID attach.
+//
+// The raw automatic-intent writes (createAutomatic, createAutomaticAdmitted)
+// are unexported so that no consumer holding a Store can record an automatic
+// intent past the admission gate; Service.AdmitAutomatic is the only public
+// automatic path. As a consequence Store can only be implemented inside this
+// package.
 type Store interface {
 	// LookupAutomatic returns the intent recorded for the automatic uniqueness
 	// domain (policyID, subject), with found=false when there is none.
@@ -21,12 +27,12 @@ type Store interface {
 	// LookupExplicit returns the intent recorded for operationID, with
 	// found=false when there is none.
 	LookupExplicit(ctx context.Context, operationID string) (stored Intent, found bool, err error)
-	// CreateAutomatic returns the intent already recorded for the draft's
+	// createAutomatic returns the intent already recorded for the draft's
 	// automatic uniqueness domain (AutoRunPolicyID, InputBindingSubjectIdentity)
 	// with created=false, or records the draft under a newly allocated ID
 	// together with its uniqueness index entry and returns created=true. An
 	// existing intent is never modified.
-	CreateAutomatic(ctx context.Context, draft Intent) (stored Intent, created bool, err error)
+	createAutomatic(ctx context.Context, draft Intent) (stored Intent, created bool, err error)
 	// CreateExplicit returns the intent already recorded for draft.OperationID
 	// with created=false, or records the operation-ledger entry and the new
 	// intent together and returns created=true. An existing intent is never
@@ -57,12 +63,12 @@ type Store interface {
 	// membership is captured in that write, after the holds; otherwise it is
 	// empty.
 	AppendPolicyTransition(ctx context.Context, policyID string, expectedSeq uint64, t PolicyTransition, holdUnassigned bool) (PolicyRecord, PolicyMembership, error)
-	// CreateAutomaticAdmitted behaves as CreateAutomatic when an intent already
+	// createAutomaticAdmitted behaves as createAutomatic when an intent already
 	// exists for the draft's automatic uniqueness domain. Otherwise it records
 	// the draft only if the draft's policy is ACTIVE at epoch, and fails with
 	// CodePolicyStale, changing nothing, if it is not. The policy check and the
 	// create are one serialized write.
-	CreateAutomaticAdmitted(ctx context.Context, draft Intent, epoch uint64) (stored Intent, created bool, err error)
+	createAutomaticAdmitted(ctx context.Context, draft Intent, epoch uint64) (stored Intent, created bool, err error)
 	// UpdateBlocker sets owner's blocker on the intent to state (BlockerClear
 	// releases it) and leaves every other owner's blocker unchanged. An unknown
 	// id fails with ps.CodeNotFound.
@@ -172,8 +178,8 @@ func (m *MemoryStore) allocateID() (ID, error) {
 	return id, nil
 }
 
-// CreateAutomatic implements Store.
-func (m *MemoryStore) CreateAutomatic(ctx context.Context, draft Intent) (Intent, bool, error) {
+// createAutomatic implements Store.
+func (m *MemoryStore) createAutomatic(ctx context.Context, draft Intent) (Intent, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return Intent{}, false, err
 	}
@@ -388,8 +394,8 @@ func (m *MemoryStore) AppendPolicyTransition(ctx context.Context, policyID strin
 	return next, members, nil
 }
 
-// CreateAutomaticAdmitted implements Store.
-func (m *MemoryStore) CreateAutomaticAdmitted(ctx context.Context, draft Intent, epoch uint64) (Intent, bool, error) {
+// createAutomaticAdmitted implements Store.
+func (m *MemoryStore) createAutomaticAdmitted(ctx context.Context, draft Intent, epoch uint64) (Intent, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return Intent{}, false, err
 	}
