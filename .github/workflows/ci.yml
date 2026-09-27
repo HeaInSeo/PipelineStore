@@ -8,10 +8,19 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ACTIONLINT_VERSION: v1.7.7
+  GOVULNCHECK_VERSION: v1.1.4
+
 jobs:
   build-test:
     name: build-test
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       # Prove the module builds and tests cgo-free (pure-Go SQLite driver).
       CGO_ENABLED: "0"
@@ -34,6 +43,11 @@ jobs:
             exit 1
           fi
 
+      - name: go mod tidy drift
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
       - name: go build
         run: go build ./...
 
@@ -41,15 +55,65 @@ jobs:
         run: go vet ./...
 
       - name: go test
-        run: go test ./...
+        run: go test -shuffle=on -count=1 ./...
 
       - name: go test -race
         # The race detector requires the cgo runtime; enable cgo for this step only.
         env:
           CGO_ENABLED: "1"
-        run: go test -race ./...
+        run: go test -race -shuffle=on -count=1 -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Coverage summary
+        if: always()
+        run: |
+          if [ -f coverage.out ]; then
+            go tool cover -func=coverage.out | tee coverage.txt
+          fi
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            coverage.out
+            coverage.txt
+          if-no-files-found: ignore
 
       - name: staticcheck
         run: |
           go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
           "$(go env GOPATH)/bin/staticcheck" ./...
+
+  actionlint:
+    name: Actionlint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: actionlint
+        run: go run "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}"
+
+  govulncheck:
+    name: Vulnerability Scan (govulncheck)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: govulncheck
+        run: go run "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}" ./...
