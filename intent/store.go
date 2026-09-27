@@ -37,6 +37,9 @@ type Store interface {
 	// with created=false, or records the operation-ledger entry and the new
 	// intent together and returns created=true. An existing intent is never
 	// modified; comparing its semantics with the draft is the caller's job.
+	// A draft that is not a fresh explicit intent (see checkExplicitDraft) fails
+	// with ps.CodeInvalidContract and writes nothing, so this exported write
+	// cannot record an automatic intent past the admission gate.
 	CreateExplicit(ctx context.Context, draft Intent) (stored Intent, created bool, err error)
 	// AttachRunID attaches run to the intent. Attaching the RunID that is
 	// already attached is a no-op. Attaching a different RunID, or a RunID
@@ -207,9 +210,30 @@ func (m *MemoryStore) createAutomatic(ctx context.Context, draft Intent) (Intent
 	return draft, true, nil
 }
 
+// checkExplicitDraft rejects a draft for the explicit write path unless it has
+// OriginExplicit and an OperationID, carries none of the automatic-only fields
+// (AutoRunPolicyID, AutoRunPolicyRevision, AdmissionEpoch), and has no RunID,
+// which is attached only through AttachRunID and its uniqueness index.
+func checkExplicitDraft(draft Intent) error {
+	switch {
+	case draft.Origin != OriginExplicit:
+		return newError(ps.CodeInvalidContract, "explicit write refuses origin %q", draft.Origin)
+	case draft.OperationID == "":
+		return newError(ps.CodeInvalidContract, "explicit write requires an OperationID")
+	case draft.AutoRunPolicyID != "" || draft.AutoRunPolicyRevision != "" || draft.AdmissionEpoch != 0:
+		return newError(ps.CodeInvalidContract, "explicit write refuses automatic policy fields")
+	case draft.RunID != "":
+		return newError(ps.CodeInvalidContract, "explicit write refuses a preset RunID")
+	}
+	return nil
+}
+
 // CreateExplicit implements Store.
 func (m *MemoryStore) CreateExplicit(ctx context.Context, draft Intent) (Intent, bool, error) {
 	if err := ctx.Err(); err != nil {
+		return Intent{}, false, err
+	}
+	if err := checkExplicitDraft(draft); err != nil {
 		return Intent{}, false, err
 	}
 

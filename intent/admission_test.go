@@ -129,6 +129,55 @@ func TestAdmission_FullExportedAPIHasNoRawAutomaticWrite(t *testing.T) {
 	}
 }
 
+// The exported generic write Store.CreateExplicit is not an automatic path
+// either: a consumer calling it directly with an automatic-shaped draft, or an
+// explicit draft carrying automatic policy fields or a preset RunID, is refused
+// with no store mutation. A well-formed explicit draft is still recorded.
+func TestAdmission_ExplicitStoreWriteRefusesNonExplicitDrafts(t *testing.T) {
+	explicit := Intent{
+		Origin:                      OriginExplicit,
+		OperationID:                 "op-direct",
+		InputBindingSubjectIdentity: "subject-1",
+		PipelineRevision:            rev1,
+	}
+	with := func(edit func(*Intent)) Intent {
+		in := explicit
+		edit(&in)
+		return in
+	}
+	cases := map[string]Intent{
+		"automatic origin": with(func(in *Intent) {
+			in.Origin = OriginAutomatic
+			in.AutoRunPolicyID = "policy-1"
+			in.AutoRunPolicyRevision = "policy-rev-1"
+		}),
+		"empty origin":          with(func(in *Intent) { in.Origin = "" }),
+		"missing OperationID":   with(func(in *Intent) { in.OperationID = "" }),
+		"AutoRunPolicyID":       with(func(in *Intent) { in.AutoRunPolicyID = "policy-1" }),
+		"AutoRunPolicyRevision": with(func(in *Intent) { in.AutoRunPolicyRevision = "policy-rev-1" }),
+		"AdmissionEpoch":        with(func(in *Intent) { in.AdmissionEpoch = 1 }),
+		"preset RunID":          with(func(in *Intent) { in.RunID = "run-1" }),
+	}
+	for name, draft := range cases {
+		t.Run(name, func(t *testing.T) {
+			store := NewMemoryStore()
+			before := snapshot(store)
+			_, created, err := store.CreateExplicit(context.Background(), draft)
+			assertCode(t, err, ps.CodeInvalidContract)
+			if created {
+				t.Fatal("refused draft reported created")
+			}
+			assertUnchanged(t, store, before)
+		})
+	}
+
+	store := NewMemoryStore()
+	stored, created, err := store.CreateExplicit(context.Background(), explicit)
+	if err != nil || !created || stored.Origin != OriginExplicit || stored.ID == "" {
+		t.Fatalf("well-formed explicit draft: stored=%+v created=%v err=%v", stored, created, err)
+	}
+}
+
 // ── fixtures ─────────────────────────────────────────────────────────────────
 
 // pos is a fake publication-order provider position. Positions compare only
