@@ -11,6 +11,25 @@ import (
 	ps "github.com/HeaInSeo/PipelineStore"
 )
 
+// AdmitAutomatic is the only exported Service method that accepts an
+// AutomaticRequest: no public path records an automatic intent without the
+// admission gate.
+func TestAdmission_OnlyPublicAutomaticPathIsAdmitAutomatic(t *testing.T) {
+	reqType := reflect.TypeOf(AutomaticRequest{})
+	svcType := reflect.TypeOf(&Service{})
+	for i := 0; i < svcType.NumMethod(); i++ {
+		m := svcType.Method(i)
+		for j := 1; j < m.Type.NumIn(); j++ {
+			if m.Type.In(j) == reqType && m.Name != "AdmitAutomatic" {
+				t.Errorf("exported Service.%s takes an AutomaticRequest outside the admission gate", m.Name)
+			}
+		}
+	}
+	if _, ok := svcType.MethodByName("AdmitAutomatic"); !ok {
+		t.Fatal("Service.AdmitAutomatic missing")
+	}
+}
+
 // ── fixtures ─────────────────────────────────────────────────────────────────
 
 // pos is a fake publication-order provider position. Positions compare only

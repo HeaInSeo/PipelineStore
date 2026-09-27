@@ -121,7 +121,7 @@ func TestAutomatic_RepeatedAndConcurrent_ExactlyOneIntent(t *testing.T) {
 	svc, store := newTestService(t)
 	ctx := context.Background()
 
-	first, err := svc.CreateAutomatic(ctx, autoReq())
+	first, err := svc.createAutomatic(ctx, autoReq())
 	if err != nil {
 		t.Fatalf("first CreateAutomatic: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestAutomatic_RepeatedAndConcurrent_ExactlyOneIntent(t *testing.T) {
 	}
 
 	for i := range 1000 {
-		res, err := svc.CreateAutomatic(ctx, autoReq())
+		res, err := svc.createAutomatic(ctx, autoReq())
 		if err != nil {
 			t.Fatalf("sequential replay %d: %v", i, err)
 		}
@@ -151,7 +151,7 @@ func TestAutomatic_RepeatedAndConcurrent_ExactlyOneIntent(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			res, err := svc.CreateAutomatic(ctx, req)
+			res, err := svc.createAutomatic(ctx, req)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
@@ -184,7 +184,7 @@ func TestAutomatic_PolicyRevisionChange_NoNewIntentNoRewrite(t *testing.T) {
 	svc, store := newTestService(t)
 	ctx := context.Background()
 
-	first, err := svc.CreateAutomatic(ctx, autoReq())
+	first, err := svc.createAutomatic(ctx, autoReq())
 	if err != nil {
 		t.Fatalf("CreateAutomatic: %v", err)
 	}
@@ -192,7 +192,7 @@ func TestAutomatic_PolicyRevisionChange_NoNewIntentNoRewrite(t *testing.T) {
 
 	later := autoReq()
 	later.AutoRunPolicyRevision = "policy-rev-2"
-	res, err := svc.CreateAutomatic(ctx, later)
+	res, err := svc.createAutomatic(ctx, later)
 	if err != nil {
 		t.Fatalf("reevaluation: %v", err)
 	}
@@ -210,7 +210,7 @@ func TestAutomatic_PipelineRevisionChange_NoNewIntentNoRewrite(t *testing.T) {
 	svc, store := newTestService(t)
 	ctx := context.Background()
 
-	first, err := svc.CreateAutomatic(ctx, autoReq())
+	first, err := svc.createAutomatic(ctx, autoReq())
 	if err != nil {
 		t.Fatalf("CreateAutomatic: %v", err)
 	}
@@ -218,7 +218,7 @@ func TestAutomatic_PipelineRevisionChange_NoNewIntentNoRewrite(t *testing.T) {
 
 	later := autoReq()
 	later.PipelineRevision = rev2
-	res, err := svc.CreateAutomatic(ctx, later)
+	res, err := svc.createAutomatic(ctx, later)
 	if err != nil {
 		t.Fatalf("reevaluation: %v", err)
 	}
@@ -234,7 +234,7 @@ func TestAutomatic_PipelineRevisionChange_NoNewIntentNoRewrite(t *testing.T) {
 	// Positive control: a different subject under the same policy is a new domain.
 	other := autoReq()
 	other.InputBindingSubjectIdentity = "subject-2"
-	res, err = svc.CreateAutomatic(ctx, other)
+	res, err = svc.createAutomatic(ctx, other)
 	if err != nil || !res.Created || res.Intent.ID == first.Intent.ID {
 		t.Fatalf("different subject: res=%+v err=%v, want a new intent", res, err)
 	}
@@ -292,7 +292,7 @@ func TestAttachRunID_SameConverges_DifferentConflicts(t *testing.T) {
 	svc, _ := newTestService(t)
 	ctx := context.Background()
 
-	res, err := svc.CreateAutomatic(ctx, autoReq())
+	res, err := svc.createAutomatic(ctx, autoReq())
 	if err != nil {
 		t.Fatalf("CreateAutomatic: %v", err)
 	}
@@ -327,13 +327,13 @@ func TestAttachRunID_RunIDOwnedByAnotherIntent_ConflictZeroMutation(t *testing.T
 	svc, store := newTestService(t)
 	ctx := context.Background()
 
-	a, err := svc.CreateAutomatic(ctx, autoReq())
+	a, err := svc.createAutomatic(ctx, autoReq())
 	if err != nil {
 		t.Fatalf("create A: %v", err)
 	}
 	other := autoReq()
 	other.InputBindingSubjectIdentity = "subject-2"
-	b, err := svc.CreateAutomatic(ctx, other)
+	b, err := svc.createAutomatic(ctx, other)
 	if err != nil {
 		t.Fatalf("create B: %v", err)
 	}
@@ -355,7 +355,7 @@ func TestAttachRunID_ConcurrentSameRunID_ExactlyOneOwner(t *testing.T) {
 	for i := range 50 {
 		req := autoReq()
 		req.InputBindingSubjectIdentity = "subject-" + strconv.Itoa(i)
-		res, err := svc.CreateAutomatic(ctx, req)
+		res, err := svc.createAutomatic(ctx, req)
 		if err != nil {
 			t.Fatalf("create %d: %v", i, err)
 		}
@@ -400,7 +400,7 @@ func TestAttachRunID_FaultInjection_NoPartialState(t *testing.T) {
 		t.Run(step, func(t *testing.T) {
 			svc, store := newTestService(t)
 			ctx := context.Background()
-			res, err := svc.CreateAutomatic(ctx, autoReq())
+			res, err := svc.createAutomatic(ctx, autoReq())
 			if err != nil {
 				t.Fatalf("CreateAutomatic: %v", err)
 			}
@@ -454,7 +454,7 @@ func TestReplay_DoesNotDependOnRevisionReader(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	auto, err := svc.CreateAutomatic(ctx, autoReq())
+	auto, err := svc.createAutomatic(ctx, autoReq())
 	if err != nil {
 		t.Fatalf("CreateAutomatic: %v", err)
 	}
@@ -468,7 +468,7 @@ func TestReplay_DoesNotDependOnRevisionReader(t *testing.T) {
 	reader.down = true
 	reader.mu.Unlock()
 
-	if res, err := svc.CreateAutomatic(ctx, autoReq()); err != nil || res.Created || res.Intent != auto.Intent {
+	if res, err := svc.createAutomatic(ctx, autoReq()); err != nil || res.Created || res.Intent != auto.Intent {
 		t.Fatalf("automatic replay with reader down: res=%+v err=%v, want the existing intent", res, err)
 	}
 	if res, err := svc.CreateExplicit(ctx, explicitReq()); err != nil || res.Created || res.Intent != expl.Intent {
@@ -486,7 +486,7 @@ func TestReplay_DoesNotDependOnRevisionReader(t *testing.T) {
 	// intent with a divergence rather than failing the read.
 	diverged := autoReq()
 	diverged.PipelineRevision = PipelineRevisionRef{PipelineID: "pipe-a", RevisionID: "rev-never-committed"}
-	res, err := svc.CreateAutomatic(ctx, diverged)
+	res, err := svc.createAutomatic(ctx, diverged)
 	if err != nil || res.Created || res.Intent != auto.Intent || res.Divergence == nil || !res.Divergence.PipelineRevisionChanged {
 		t.Fatalf("automatic replay on uncommitted revision: res=%+v err=%v", res, err)
 	}
@@ -494,7 +494,7 @@ func TestReplay_DoesNotDependOnRevisionReader(t *testing.T) {
 	// A genuinely new intent still requires the exact revision read.
 	fresh := autoReq()
 	fresh.InputBindingSubjectIdentity = "subject-new"
-	if _, err := svc.CreateAutomatic(ctx, fresh); err == nil {
+	if _, err := svc.createAutomatic(ctx, fresh); err == nil {
 		t.Fatal("new intent created while the revision reader is down")
 	}
 	assertUnchanged(t, store, before)
@@ -516,10 +516,10 @@ func TestMemoryStore_FaultInjection_NoPartialState(t *testing.T) {
 			return s.CreateExplicit(context.Background(), explicitReq())
 		}},
 		{"automatic/after-index", stepIndexStaged, func(s *Service) (CreateResult, error) {
-			return s.CreateAutomatic(context.Background(), autoReq())
+			return s.createAutomatic(context.Background(), autoReq())
 		}},
 		{"automatic/after-intent", stepIntentStaged, func(s *Service) (CreateResult, error) {
-			return s.CreateAutomatic(context.Background(), autoReq())
+			return s.createAutomatic(context.Background(), autoReq())
 		}},
 	}
 	for _, tc := range cases {
@@ -573,7 +573,7 @@ func TestEmptyCoordinates_FailClosedZeroMutation(t *testing.T) {
 	for _, tc := range autoCases {
 		req := autoReq()
 		tc.mutate(&req)
-		_, err := svc.CreateAutomatic(ctx, req)
+		_, err := svc.createAutomatic(ctx, req)
 		if ps.CodeOf(err) != CodeMissingCoordinate {
 			t.Errorf("automatic %s: err = %v, want %s", tc.name, err, CodeMissingCoordinate)
 		}
@@ -607,7 +607,7 @@ func TestEmptyCoordinates_FailClosedZeroMutation(t *testing.T) {
 	// A well-formed but uncommitted revision coordinate fails the exact read.
 	uncommitted := autoReq()
 	uncommitted.PipelineRevision = PipelineRevisionRef{PipelineID: "pipe-a", RevisionID: "rev-unknown"}
-	_, err := svc.CreateAutomatic(ctx, uncommitted)
+	_, err := svc.createAutomatic(ctx, uncommitted)
 	assertCode(t, err, ps.CodeNotFound)
 	uncommittedExplicit := explicitReq()
 	uncommittedExplicit.PipelineRevision = PipelineRevisionRef{PipelineID: "pipe-other", RevisionID: "rev-1"}
@@ -625,7 +625,7 @@ func TestRequireCommitted_RejectsMismatchedRead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}
-	_, err = svc.CreateAutomatic(context.Background(), autoReq())
+	_, err = svc.createAutomatic(context.Background(), autoReq())
 	assertCode(t, err, ps.CodeNotFound)
 	assertUnchanged(t, store, snapshot(NewMemoryStore()))
 }
@@ -680,7 +680,7 @@ func TestCallerMutation_DoesNotReachStoredIntent(t *testing.T) {
 	ctx := context.Background()
 
 	req := autoReq()
-	res, err := svc.CreateAutomatic(ctx, req)
+	res, err := svc.createAutomatic(ctx, req)
 	if err != nil {
 		t.Fatalf("CreateAutomatic: %v", err)
 	}
@@ -705,7 +705,7 @@ func TestCallerMutation_DoesNotReachStoredIntent(t *testing.T) {
 	}
 
 	// A value returned by a replay is likewise a copy.
-	replay, err := svc.CreateAutomatic(ctx, autoReq())
+	replay, err := svc.createAutomatic(ctx, autoReq())
 	if err != nil {
 		t.Fatalf("replay: %v", err)
 	}

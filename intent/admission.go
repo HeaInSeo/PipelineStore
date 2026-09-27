@@ -348,9 +348,10 @@ func (s *Service) stopPolicy(ctx context.Context, policyID string, kind Transiti
 	return LifecycleResult{}, newError(CodePolicyStale, "policy %q changed concurrently on every attempt", policyID)
 }
 
-// AdmitAutomatic is the automatic admission gate. An existing intent for
-// (AutoRunPolicyID, InputBindingSubjectIdentity) is replayed as in
-// CreateAutomatic. Otherwise a new intent is recorded only if the policy is
+// AdmitAutomatic is the automatic admission gate and the only public path that
+// records an automatic intent. An existing intent for
+// (AutoRunPolicyID, InputBindingSubjectIdentity) is replayed without a new
+// admission decision. Otherwise a new intent is recorded only if the policy is
 // ACTIVE, the occurrence class is exactly NEW, and the publication position is
 // known, comparable with, and strictly after the current epoch's frontier.
 // Every other case is NotAdmitted and writes nothing.
