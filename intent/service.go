@@ -48,16 +48,18 @@ func (s *Service) requireCommitted(ctx context.Context, ref PipelineRevisionRef)
 	return nil
 }
 
-// CreateAutomatic records the automatic intent for the request's uniqueness
-// domain (AutoRunPolicyID, InputBindingSubjectIdentity), or returns the one
-// already recorded. A replay never creates a second intent and never rewrites
-// the frozen policy or pipeline revision; a replay that observed different
-// revisions is reported through CreateResult.Divergence.
+// createAutomatic is the internal PIPE-I0 primitive: it records the automatic
+// intent for the request's uniqueness domain (AutoRunPolicyID,
+// InputBindingSubjectIdentity), or returns the one already recorded, without
+// any admission check. It is not part of the public Service API; the only
+// public automatic path is AdmitAutomatic. A replay never creates a second
+// intent and never rewrites the frozen policy or pipeline revision; a replay
+// that observed different revisions is reported through CreateResult.Divergence.
 //
 // A replay is resolved from the store before the revision read, so it neither
 // depends on the revision reader being available nor on the observed revision
 // being committed; only a call that may create an intent reads the revision.
-func (s *Service) CreateAutomatic(ctx context.Context, req AutomaticRequest) (CreateResult, error) {
+func (s *Service) createAutomatic(ctx context.Context, req AutomaticRequest) (CreateResult, error) {
 	if err := req.validate(); err != nil {
 		return CreateResult{}, err
 	}
@@ -71,7 +73,7 @@ func (s *Service) CreateAutomatic(ctx context.Context, req AutomaticRequest) (Cr
 	if err := s.requireCommitted(ctx, req.PipelineRevision); err != nil {
 		return CreateResult{}, err
 	}
-	stored, created, err := s.store.CreateAutomatic(ctx, Intent{
+	stored, created, err := s.store.createAutomatic(ctx, Intent{
 		Origin:                      OriginAutomatic,
 		AutoRunPolicyID:             req.AutoRunPolicyID,
 		AutoRunPolicyRevision:       req.AutoRunPolicyRevision,
@@ -107,7 +109,7 @@ func automaticReplay(stored Intent, req AutomaticRequest) CreateResult {
 // CreateExplicit records the explicit intent for the request's OperationID, or
 // returns the one already recorded when the semantics match. The same
 // OperationID with different semantics fails with ps.CodeOperationConflict and
-// writes nothing. As with CreateAutomatic, an existing OperationID is resolved
+// writes nothing. As with automatic intents, an existing OperationID is resolved
 // before the revision read.
 func (s *Service) CreateExplicit(ctx context.Context, req ExplicitRequest) (CreateResult, error) {
 	if err := req.validate(); err != nil {
@@ -129,7 +131,7 @@ func (s *Service) CreateExplicit(ctx context.Context, req ExplicitRequest) (Crea
 	if err := s.requireCommitted(ctx, req.PipelineRevision); err != nil {
 		return CreateResult{}, err
 	}
-	stored, created, err := s.store.CreateExplicit(ctx, draft)
+	stored, created, err := s.store.createExplicit(ctx, draft)
 	if err != nil {
 		return CreateResult{}, err
 	}

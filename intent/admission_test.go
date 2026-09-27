@@ -4,12 +4,221 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"go/types"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
 	ps "github.com/HeaInSeo/PipelineStore"
 )
+
+// consumerAutomaticMethods is every method a consumer can call on a value of
+// the package's exported Service/Store/MemoryStore types whose name mentions
+// automatic intents. Only the admission gate and the read-only lookup may be
+// reachable; a raw automatic write would bypass admission.
+var consumerAutomaticMethods = map[string]bool{
+	"AdmitAutomatic":  true,
+	"LookupAutomatic": true,
+}
+
+// No value a consumer can obtain (Service, the Store interface, or the
+// MemoryStore reference implementation) exposes a method that records an
+// automatic intent outside Service.AdmitAutomatic.
+func TestAdmission_ConsumerMethodSetsExposeNoRawAutomaticWrite(t *testing.T) {
+	reqType := reflect.TypeOf(AutomaticRequest{})
+	consumerTypes := []reflect.Type{
+		reflect.TypeOf(&Service{}),
+		reflect.TypeOf((*Store)(nil)).Elem(),
+		reflect.TypeOf(NewMemoryStore()),
+	}
+	for _, typ := range consumerTypes {
+		for i := 0; i < typ.NumMethod(); i++ {
+			m := typ.Method(i)
+			if !m.IsExported() {
+				// An interface's method set lists unexported methods too; a
+				// consumer outside the package cannot call them.
+				continue
+			}
+			if strings.Contains(m.Name, "Automatic") && !consumerAutomaticMethods[m.Name] {
+				t.Errorf("exported %v.%s reaches automatic intent state outside the admission gate", typ, m.Name)
+			}
+			for j := 0; j < m.Type.NumIn(); j++ {
+				if m.Type.In(j) == reqType && m.Name != "AdmitAutomatic" {
+					t.Errorf("exported %v.%s takes an AutomaticRequest outside the admission gate", typ, m.Name)
+				}
+			}
+		}
+	}
+	if _, ok := reflect.TypeOf(&Service{}).MethodByName("AdmitAutomatic"); !ok {
+		t.Fatal("Service.AdmitAutomatic missing")
+	}
+}
+
+// The same invariant over the package's full exported API as written in
+// source: every exported function, every exported method on any type, and
+// every exported method of any interface. Reflection cannot enumerate
+// package-level functions, so the non-test sources are parsed.
+func TestAdmission_FullExportedAPIHasNoRawAutomaticWrite(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	checked := 0
+	check := func(owner, name string, params *ast.FieldList) {
+		checked++
+		if strings.Contains(name, "Automatic") && !consumerAutomaticMethods[name] {
+			t.Errorf("exported %s%s reaches automatic intent state outside the admission gate", owner, name)
+		}
+		for _, p := range params.List {
+			if id, ok := p.Type.(*ast.Ident); ok && id.Name == "AutomaticRequest" && name != "AdmitAutomatic" {
+				t.Errorf("exported %s%s takes an AutomaticRequest outside the admission gate", owner, name)
+			}
+		}
+	}
+	for _, path := range files {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, path, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, decl := range f.Decls {
+			switch d := decl.(type) {
+			case *ast.FuncDecl:
+				if d.Name.IsExported() {
+					owner := ""
+					if d.Recv != nil && len(d.Recv.List) > 0 {
+						owner = types.ExprString(d.Recv.List[0].Type) + "."
+					}
+					check(owner, d.Name.Name, d.Type.Params)
+				}
+			case *ast.GenDecl:
+				for _, spec := range d.Specs {
+					ts, ok := spec.(*ast.TypeSpec)
+					if !ok {
+						continue
+					}
+					it, ok := ts.Type.(*ast.InterfaceType)
+					if !ok || !ts.Name.IsExported() {
+						continue
+					}
+					for _, m := range it.Methods.List {
+						ft, ok := m.Type.(*ast.FuncType)
+						if !ok {
+							continue
+						}
+						for _, n := range m.Names {
+							if n.IsExported() {
+								check(ts.Name.Name+".", n.Name, ft.Params)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no exported API found; the source scan is broken")
+	}
+}
+
+// No value a consumer can obtain exposes a method that records a raw intent
+// draft. The explicit store write skips the committed-PipelineRevision read, so
+// a consumer holding a Store or MemoryStore must not be able to reach it;
+// Service.CreateExplicit is the only public explicit path, and it refuses an
+// absent or uncommitted revision without touching the store.
+func TestAdmission_ConsumerMethodSetsExposeNoRawIntentWrite(t *testing.T) {
+	intentType := reflect.TypeOf(Intent{})
+	for _, typ := range []reflect.Type{
+		reflect.TypeOf((*Store)(nil)).Elem(),
+		reflect.TypeOf(NewMemoryStore()),
+	} {
+		for i := 0; i < typ.NumMethod(); i++ {
+			m := typ.Method(i)
+			if !m.IsExported() {
+				continue
+			}
+			for j := 0; j < m.Type.NumIn(); j++ {
+				if m.Type.In(j) == intentType {
+					t.Errorf("exported %v.%s records a raw Intent draft past the Service committed-revision check", typ, m.Name)
+				}
+			}
+		}
+	}
+
+	svc, store := newTestService(t)
+	before := snapshot(store)
+	for name, ref := range map[string]PipelineRevisionRef{
+		"absent pipeline":      {PipelineID: "pipe-absent", RevisionID: "rev-1"},
+		"uncommitted revision": {PipelineID: rev1.PipelineID, RevisionID: "rev-uncommitted"},
+	} {
+		req := explicitReq()
+		req.OperationID = "op-" + strings.ReplaceAll(name, " ", "-")
+		req.PipelineRevision = ref
+		res, err := svc.CreateExplicit(context.Background(), req)
+		assertCode(t, err, ps.CodeNotFound)
+		if res.Created {
+			t.Errorf("%s: refused explicit intent reported created", name)
+		}
+	}
+	assertUnchanged(t, store, before)
+}
+
+// The raw explicit store write is not an automatic path either: an
+// automatic-shaped draft, or an explicit draft carrying automatic policy fields
+// or a preset RunID, is refused with no store mutation. A well-formed explicit
+// draft is still recorded.
+func TestAdmission_ExplicitStoreWriteRefusesNonExplicitDrafts(t *testing.T) {
+	explicit := Intent{
+		Origin:                      OriginExplicit,
+		OperationID:                 "op-direct",
+		InputBindingSubjectIdentity: "subject-1",
+		PipelineRevision:            rev1,
+	}
+	with := func(edit func(*Intent)) Intent {
+		in := explicit
+		edit(&in)
+		return in
+	}
+	cases := map[string]Intent{
+		"automatic origin": with(func(in *Intent) {
+			in.Origin = OriginAutomatic
+			in.AutoRunPolicyID = "policy-1"
+			in.AutoRunPolicyRevision = "policy-rev-1"
+		}),
+		"empty origin":          with(func(in *Intent) { in.Origin = "" }),
+		"missing OperationID":   with(func(in *Intent) { in.OperationID = "" }),
+		"AutoRunPolicyID":       with(func(in *Intent) { in.AutoRunPolicyID = "policy-1" }),
+		"AutoRunPolicyRevision": with(func(in *Intent) { in.AutoRunPolicyRevision = "policy-rev-1" }),
+		"AdmissionEpoch":        with(func(in *Intent) { in.AdmissionEpoch = 1 }),
+		"preset RunID":          with(func(in *Intent) { in.RunID = "run-1" }),
+	}
+	for name, draft := range cases {
+		t.Run(name, func(t *testing.T) {
+			store := NewMemoryStore()
+			before := snapshot(store)
+			_, created, err := store.createExplicit(context.Background(), draft)
+			assertCode(t, err, ps.CodeInvalidContract)
+			if created {
+				t.Fatal("refused draft reported created")
+			}
+			assertUnchanged(t, store, before)
+		})
+	}
+
+	store := NewMemoryStore()
+	stored, created, err := store.createExplicit(context.Background(), explicit)
+	if err != nil || !created || stored.Origin != OriginExplicit || stored.ID == "" {
+		t.Fatalf("well-formed explicit draft: stored=%+v created=%v err=%v", stored, created, err)
+	}
+}
 
 // ── fixtures ─────────────────────────────────────────────────────────────────
 

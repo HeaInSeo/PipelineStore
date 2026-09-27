@@ -28,6 +28,10 @@
 // incomparable facts are not admitted. Scope boundary (PIPE-I3): no Tori
 // adapter or wire format, no Run submit, Campaign, GC, or Authorization
 // provider, no multiple-policy conflict handling, and no submit-equality
-// authority (jumi.submit-intent.v1 is JUMI-owned). Service.CreateAutomatic
-// remains the ungated PIPE-I0 primitive and is not an automatic admission path.
+// authority (jumi.submit-intent.v1 is JUMI-owned). Service.AdmitAutomatic is
+// the only public way to record an automatic intent, and Service.CreateExplicit
+// the only public way to record an explicit one; the ungated PIPE-I0 primitive
+// and the raw store writes (Store.createAutomatic, Store.createAutomaticAdmitted,
+// Store.createExplicit) are unexported, so a Store is implementable only inside
+// this package.
 package intent
