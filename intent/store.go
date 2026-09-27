@@ -15,11 +15,12 @@ import (
 // failure at any point leaves either all of a call's writes or none of them.
 // Stored intents are immutable except for the one-time RunID attach.
 //
-// The raw automatic-intent writes (createAutomatic, createAutomaticAdmitted)
-// are unexported so that no consumer holding a Store can record an automatic
-// intent past the admission gate; Service.AdmitAutomatic is the only public
-// automatic path. As a consequence Store can only be implemented inside this
-// package.
+// The raw intent writes (createAutomatic, createAutomaticAdmitted,
+// createExplicit) are unexported so that no consumer holding a Store can record
+// an intent past the Service checks: Service.AdmitAutomatic is the only public
+// automatic path and Service.CreateExplicit, which confirms the committed
+// PipelineRevision by exact read, the only public explicit path. As a
+// consequence Store can only be implemented inside this package.
 type Store interface {
 	// LookupAutomatic returns the intent recorded for the automatic uniqueness
 	// domain (policyID, subject), with found=false when there is none.
@@ -33,14 +34,14 @@ type Store interface {
 	// together with its uniqueness index entry and returns created=true. An
 	// existing intent is never modified.
 	createAutomatic(ctx context.Context, draft Intent) (stored Intent, created bool, err error)
-	// CreateExplicit returns the intent already recorded for draft.OperationID
+	// createExplicit returns the intent already recorded for draft.OperationID
 	// with created=false, or records the operation-ledger entry and the new
 	// intent together and returns created=true. An existing intent is never
-	// modified; comparing its semantics with the draft is the caller's job.
-	// A draft that is not a fresh explicit intent (see checkExplicitDraft) fails
-	// with ps.CodeInvalidContract and writes nothing, so this exported write
-	// cannot record an automatic intent past the admission gate.
-	CreateExplicit(ctx context.Context, draft Intent) (stored Intent, created bool, err error)
+	// modified; comparing its semantics with the draft, and confirming that
+	// draft.PipelineRevision is committed, is the caller's job. A draft that is
+	// not a fresh explicit intent (see checkExplicitDraft) fails with
+	// ps.CodeInvalidContract and writes nothing.
+	createExplicit(ctx context.Context, draft Intent) (stored Intent, created bool, err error)
 	// AttachRunID attaches run to the intent. Attaching the RunID that is
 	// already attached is a no-op. Attaching a different RunID, or a RunID
 	// already attached to another intent in this store, fails with
@@ -228,8 +229,8 @@ func checkExplicitDraft(draft Intent) error {
 	return nil
 }
 
-// CreateExplicit implements Store.
-func (m *MemoryStore) CreateExplicit(ctx context.Context, draft Intent) (Intent, bool, error) {
+// createExplicit implements Store.
+func (m *MemoryStore) createExplicit(ctx context.Context, draft Intent) (Intent, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return Intent{}, false, err
 	}

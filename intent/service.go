@@ -131,7 +131,7 @@ func (s *Service) CreateExplicit(ctx context.Context, req ExplicitRequest) (Crea
 	if err := s.requireCommitted(ctx, req.PipelineRevision); err != nil {
 		return CreateResult{}, err
 	}
-	stored, created, err := s.store.CreateExplicit(ctx, draft)
+	stored, created, err := s.store.createExplicit(ctx, draft)
 	if err != nil {
 		return CreateResult{}, err
 	}

@@ -129,10 +129,52 @@ func TestAdmission_FullExportedAPIHasNoRawAutomaticWrite(t *testing.T) {
 	}
 }
 
-// The exported generic write Store.CreateExplicit is not an automatic path
-// either: a consumer calling it directly with an automatic-shaped draft, or an
-// explicit draft carrying automatic policy fields or a preset RunID, is refused
-// with no store mutation. A well-formed explicit draft is still recorded.
+// No value a consumer can obtain exposes a method that records a raw intent
+// draft. The explicit store write skips the committed-PipelineRevision read, so
+// a consumer holding a Store or MemoryStore must not be able to reach it;
+// Service.CreateExplicit is the only public explicit path, and it refuses an
+// absent or uncommitted revision without touching the store.
+func TestAdmission_ConsumerMethodSetsExposeNoRawIntentWrite(t *testing.T) {
+	intentType := reflect.TypeOf(Intent{})
+	for _, typ := range []reflect.Type{
+		reflect.TypeOf((*Store)(nil)).Elem(),
+		reflect.TypeOf(NewMemoryStore()),
+	} {
+		for i := 0; i < typ.NumMethod(); i++ {
+			m := typ.Method(i)
+			if !m.IsExported() {
+				continue
+			}
+			for j := 0; j < m.Type.NumIn(); j++ {
+				if m.Type.In(j) == intentType {
+					t.Errorf("exported %v.%s records a raw Intent draft past the Service committed-revision check", typ, m.Name)
+				}
+			}
+		}
+	}
+
+	svc, store := newTestService(t)
+	before := snapshot(store)
+	for name, ref := range map[string]PipelineRevisionRef{
+		"absent pipeline":      {PipelineID: "pipe-absent", RevisionID: "rev-1"},
+		"uncommitted revision": {PipelineID: rev1.PipelineID, RevisionID: "rev-uncommitted"},
+	} {
+		req := explicitReq()
+		req.OperationID = "op-" + strings.ReplaceAll(name, " ", "-")
+		req.PipelineRevision = ref
+		res, err := svc.CreateExplicit(context.Background(), req)
+		assertCode(t, err, ps.CodeNotFound)
+		if res.Created {
+			t.Errorf("%s: refused explicit intent reported created", name)
+		}
+	}
+	assertUnchanged(t, store, before)
+}
+
+// The raw explicit store write is not an automatic path either: an
+// automatic-shaped draft, or an explicit draft carrying automatic policy fields
+// or a preset RunID, is refused with no store mutation. A well-formed explicit
+// draft is still recorded.
 func TestAdmission_ExplicitStoreWriteRefusesNonExplicitDrafts(t *testing.T) {
 	explicit := Intent{
 		Origin:                      OriginExplicit,
@@ -162,7 +204,7 @@ func TestAdmission_ExplicitStoreWriteRefusesNonExplicitDrafts(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			store := NewMemoryStore()
 			before := snapshot(store)
-			_, created, err := store.CreateExplicit(context.Background(), draft)
+			_, created, err := store.createExplicit(context.Background(), draft)
 			assertCode(t, err, ps.CodeInvalidContract)
 			if created {
 				t.Fatal("refused draft reported created")
@@ -172,7 +214,7 @@ func TestAdmission_ExplicitStoreWriteRefusesNonExplicitDrafts(t *testing.T) {
 	}
 
 	store := NewMemoryStore()
-	stored, created, err := store.CreateExplicit(context.Background(), explicit)
+	stored, created, err := store.createExplicit(context.Background(), explicit)
 	if err != nil || !created || stored.Origin != OriginExplicit || stored.ID == "" {
 		t.Fatalf("well-formed explicit draft: stored=%+v created=%v err=%v", stored, created, err)
 	}
