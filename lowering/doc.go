@@ -12,6 +12,13 @@
 // JUMI fallback: run.failurePolicy.mode is "fail-fast" and
 // defaults.retryPolicy.maxAttempts is 1.
 //
+// The exact revision reaches JUMI as provenance in the spec's metadata map
+// (W40-PS-META-1): the reserved keys pipelinestore.pipelineId,
+// pipelinestore.pipelineRevisionId and pipelinestore.pipelineContractDigest
+// carry the verified revision's values verbatim. The same contract lowered
+// from two different revisions therefore yields different specs. JUMI does not
+// validate or compare these keys today.
+//
 // Every DirectEdge is lowered from one source of truth into both a
 // Graph.Edges dependency and the consumer's ArtifactBinding (BindingName and
 // ChildInputName are the consumer input port name). CheckSpec re-verifies that
