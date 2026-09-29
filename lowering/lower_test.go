@@ -166,7 +166,13 @@ func TestLower_TwoNodeSingle(t *testing.T) {
 	nodeB.ArtifactBindings = []lowering.ArtifactBinding{bind}
 	graph := lowering.Graph{Nodes: []lowering.Node{nodeA, nodeB}, Edges: [][]string{{"a", "b"}}}
 	defaults := lowering.Defaults{RetryPolicy: lowering.RetryPolicy{MaxAttempts: 1}}
-	want := lowering.RunSpec{Run: run, Graph: graph, Defaults: defaults}
+	in := input(t, twoNodeJSON)
+	meta := map[string]string{
+		lowering.MetadataKeyPipelineID:             "pipe-1",
+		lowering.MetadataKeyPipelineRevisionID:     "rev-1",
+		lowering.MetadataKeyPipelineContractDigest: in.Revision.ContractDigest,
+	}
+	want := lowering.RunSpec{Run: run, Graph: graph, Defaults: defaults, Metadata: meta}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("lowered spec mismatch:\n got  %+v\n want %+v", got, want)
 	}
@@ -217,6 +223,7 @@ func TestLower_NoAliasing(t *testing.T) {
 
 	spec.Graph.Nodes[1].Command[0] = "/bin/other"
 	spec.Graph.Nodes[1].ArtifactBindings[0].ProducerNodeID = "x"
+	spec.Metadata[lowering.MetadataKeyPipelineRevisionID] = "rev-evil"
 	again := mustLower(t, input(t, twoNodeJSON))
 	if !reflect.DeepEqual(again, want) {
 		t.Fatalf("spec mutation leaked into a later lowering")
@@ -252,6 +259,52 @@ func TestLower_FrozenMetadataNeverGenerated(t *testing.T) {
 		if _, ok := m[k]; ok {
 			t.Fatalf("empty %s was emitted", k)
 		}
+	}
+}
+
+// TestLower_RevisionProvenance is the W40-PS-META-1 regression: the same
+// contract lowered from two different revision references used to produce
+// byte-identical specs, so the revision never reached JUMI. The reserved
+// metadata keys must now carry each revision's exact values verbatim, and
+// only the metadata may differ.
+func TestLower_RevisionProvenance(t *testing.T) {
+	first := input(t, twoNodeJSON)
+	second := input(t, twoNodeJSON)
+	second.Revision.PipelineID = "pipe-OTHER"
+	second.Revision.RevisionID = "rev-OTHER"
+
+	a := mustLower(t, first)
+	b := mustLower(t, second)
+	for _, tc := range []struct {
+		in   lowering.Input
+		spec lowering.RunSpec
+	}{{first, a}, {second, b}} {
+		want := map[string]string{
+			lowering.MetadataKeyPipelineID:             tc.in.Revision.PipelineID,
+			lowering.MetadataKeyPipelineRevisionID:     string(tc.in.Revision.RevisionID),
+			lowering.MetadataKeyPipelineContractDigest: tc.in.Revision.ContractDigest,
+		}
+		if !reflect.DeepEqual(tc.spec.Metadata, want) {
+			t.Fatalf("metadata = %v, want %v", tc.spec.Metadata, want)
+		}
+	}
+	if a.Metadata[lowering.MetadataKeyPipelineContractDigest] != b.Metadata[lowering.MetadataKeyPipelineContractDigest] {
+		t.Fatalf("same contract produced different digests: %q vs %q",
+			a.Metadata[lowering.MetadataKeyPipelineContractDigest], b.Metadata[lowering.MetadataKeyPipelineContractDigest])
+	}
+	if a.Run.RunID != b.Run.RunID || !reflect.DeepEqual(a.Graph, b.Graph) || !reflect.DeepEqual(a.Defaults, b.Defaults) {
+		t.Fatalf("revision reference changed more than metadata")
+	}
+	rawA, err := json.Marshal(a)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	rawB, err := json.Marshal(b)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if bytes.Equal(rawA, rawB) {
+		t.Fatalf("different revision references lowered to byte-identical specs: %s", rawA)
 	}
 }
 
@@ -510,6 +563,13 @@ func TestCheckSpec_NegativeGoldens(t *testing.T) {
 		{"dangling edge", func(s *lowering.RunSpec) { s.Graph.Edges = append(s.Graph.Edges, []string{"a", "z"}) }, ps.CodeEdgeInvalid},
 		{"malformed edge", func(s *lowering.RunSpec) { s.Graph.Edges = append(s.Graph.Edges, []string{"a"}) }, ps.CodeEdgeInvalid},
 		{"cycle", func(s *lowering.RunSpec) { s.Graph.Edges = append(s.Graph.Edges, []string{"b", "a"}) }, ps.CodeGraphCycle},
+		{"metadata omitted", func(s *lowering.RunSpec) { s.Metadata = nil }, lowering.CodeMissingFrozenInput},
+		{"pipeline id missing", func(s *lowering.RunSpec) { delete(s.Metadata, lowering.MetadataKeyPipelineID) }, lowering.CodeMissingFrozenInput},
+		{"revision id empty", func(s *lowering.RunSpec) { s.Metadata[lowering.MetadataKeyPipelineRevisionID] = "" }, lowering.CodeMissingFrozenInput},
+		{"contract digest missing", func(s *lowering.RunSpec) {
+			delete(s.Metadata, lowering.MetadataKeyPipelineContractDigest)
+		}, lowering.CodeMissingFrozenInput},
+		{"caller metadata merged", func(s *lowering.RunSpec) { s.Metadata["team"] = "x" }, ps.CodeInvalidContract},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -13,7 +13,9 @@ import (
 // same-source invariant JUMI does not check: BindingName equals
 // ChildInputName, which is a declared consumer input; the producer node exists
 // and ProducerOutputName is one of its outputs; the [producer, consumer]
-// dependency edge exists; and every edge carries at least one binding.
+// dependency edge exists; and every edge carries at least one binding. It also
+// requires the revision provenance metadata to be exactly the three reserved
+// keys, each non-empty.
 //
 // Several bindings may share one edge (distinct ports between the same node
 // pair); edges and bindings are not required to be 1:1.
@@ -29,6 +31,9 @@ func CheckSpec(s RunSpec) error {
 	}
 	if s.Defaults.RetryPolicy.MaxAttempts != MaxAttemptsV1 {
 		return newError(ps.CodeInvalidContract, "defaults.retryPolicy.maxAttempts is %d, want %d", s.Defaults.RetryPolicy.MaxAttempts, MaxAttemptsV1)
+	}
+	if err := checkMetadata(s.Metadata); err != nil {
+		return err
 	}
 	if len(s.Graph.Nodes) == 0 {
 		return newError(ps.CodeInvalidContract, "graph.nodes must not be empty")
@@ -107,6 +112,25 @@ func CheckSpec(s RunSpec) error {
 		if !edgeSet[[2]string{e[0], e[1]}] {
 			return sameSource("edge %v carries no artifact binding", e)
 		}
+	}
+	return nil
+}
+
+// checkMetadata requires exactly the three reserved provenance keys, each
+// non-empty (W40-PS-META-1). Any other key means caller metadata was merged.
+func checkMetadata(m map[string]string) error {
+	for _, k := range []string{MetadataKeyPipelineID, MetadataKeyPipelineRevisionID, MetadataKeyPipelineContractDigest} {
+		if m[k] == "" {
+			return missing("metadata." + k)
+		}
+	}
+	if len(m) != 3 {
+		keys := make([]string, 0, len(m))
+		for k := range m {
+			keys = append(keys, k)
+		}
+		slices.Sort(keys)
+		return newError(ps.CodeInvalidContract, "metadata carries keys %v; only the reserved pipelinestore provenance keys are allowed", keys)
 	}
 	return nil
 }

@@ -219,6 +219,12 @@ func Lower(in Input) (RunSpec, error) {
 		},
 		Graph:    Graph{Nodes: nodes, Edges: edges},
 		Defaults: Defaults{RetryPolicy: RetryPolicy{MaxAttempts: MaxAttemptsV1}},
+		// Exact values verifyRevision just checked; never rehashed or merged.
+		Metadata: map[string]string{
+			MetadataKeyPipelineID:             in.Revision.PipelineID,
+			MetadataKeyPipelineRevisionID:     string(in.Revision.RevisionID),
+			MetadataKeyPipelineContractDigest: in.Revision.ContractDigest,
+		},
 	}
 	if spec.Graph.Edges == nil {
 		spec.Graph.Edges = [][]string{}

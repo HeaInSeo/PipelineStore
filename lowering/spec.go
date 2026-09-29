@@ -13,11 +13,23 @@ const FailureModeFailFast = "fail-fast"
 // MaxAttemptsV1 is the PIPE-D2 v1 default retry budget.
 const MaxAttemptsV1 = 1
 
+// Reserved RunSpec.Metadata keys (W40-PS-META-1). Lower sets exactly these
+// three from the verified revision: the (PipelineID, PipelineRevisionID) pair
+// is the authored revision provenance and the contract digest is integrity
+// evidence. They are neither a RunID substitute nor recomputed, and no caller
+// metadata is ever merged in.
+const (
+	MetadataKeyPipelineID             = "pipelinestore.pipelineId"
+	MetadataKeyPipelineRevisionID     = "pipelinestore.pipelineRevisionId"
+	MetadataKeyPipelineContractDigest = "pipelinestore.pipelineContractDigest"
+)
+
 // RunSpec is the lowered executable Run specification.
 type RunSpec struct {
-	Run      RunMetadata `json:"run"`
-	Graph    Graph       `json:"graph"`
-	Defaults Defaults    `json:"defaults"`
+	Run      RunMetadata       `json:"run"`
+	Graph    Graph             `json:"graph"`
+	Defaults Defaults          `json:"defaults"`
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 // RunMetadata carries the caller-frozen Run identity and metadata.
