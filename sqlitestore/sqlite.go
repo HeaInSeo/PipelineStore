@@ -21,6 +21,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	ps "github.com/HeaInSeo/PipelineStore"
+	"github.com/HeaInSeo/PipelineStore/intent"
 )
 
 // Store is a durable SQLite-backed Store.
@@ -82,6 +83,14 @@ func Open(dbPath string, res ps.Resolvers) (*Store, error) {
 
 // Close releases the underlying database handle.
 func (s *Store) Close() error { return s.db.Close() }
+
+// IntentStore returns the J1 durable intent.Store on this same database file,
+// creating its tables if needed. It shares this Store's handle and lifetime:
+// Close releases both. The policy lifecycle log is not persisted (see
+// intent.SQLiteStore).
+func (s *Store) IntentStore(ctx context.Context) (*intent.SQLiteStore, error) {
+	return intent.NewSQLiteStore(ctx, s.db)
+}
 
 // requestFingerprint is the immutable-body identity for an operation:
 // SHA256(pipeline_id \0 contract_digest). Same operation_id + same fingerprint is
