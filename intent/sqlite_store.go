@@ -164,7 +164,8 @@ var intentIndexes = []struct {
 // the stored SQL text: intents is a table with exactly the intent columns
 // (declared types as in sqliteSchema, all NOT NULL, intent_id the primary
 // key), and each required index is a unique partial index on intents over its
-// key columns whose WHERE predicate is the expected one. SQLite exposes the
+// key columns, each compared with BINARY collation (see verifyBinaryKeys),
+// whose WHERE predicate is the expected one. SQLite exposes the
 // predicate only inside the stored CREATE INDEX text, so the predicate alone is
 // compared token by token (see indexPredicate); the rest of the text is not. A
 // mismatch fails with ps.CodeIntegrity; nothing is repaired.
@@ -214,12 +215,16 @@ func verifySchemaObjects(ctx context.Context, conn *sql.Conn) error {
 		if !meta.unique || !meta.partial {
 			return newError(ps.CodeIntegrity, "intent index %q is unique=%v partial=%v, want a unique partial index", want.name, meta.unique, meta.partial)
 		}
-		cols, err := queryStrings(ctx, conn, `SELECT name FROM pragma_index_info(?) ORDER BY seqno`, want.name)
+		// An expression key has no column name; it reads as "" and never matches.
+		cols, err := queryStrings(ctx, conn, `SELECT coalesce(name, '') FROM pragma_index_info(?) ORDER BY seqno`, want.name)
 		if err != nil {
 			return err
 		}
 		if !equalStrings(cols, want.columns) {
 			return newError(ps.CodeIntegrity, "intent index %q covers %v, want %v", want.name, cols, want.columns)
+		}
+		if err := verifyBinaryKeys(ctx, conn, want.name); err != nil {
+			return err
 		}
 		var ddl string
 		if err := conn.QueryRowContext(ctx,
@@ -479,6 +484,24 @@ func verifyIntentColumns(ctx context.Context, conn *sql.Conn) error {
 	}
 	if !equalStrings(got, want) {
 		return newError(ps.CodeIntegrity, "intents columns are %v, want %v", got, want)
+	}
+	return nil
+}
+
+// verifyBinaryKeys checks that every key column of index compares with the
+// BINARY collation. Intent identities are opaque byte strings: NOCASE, RTRIM or
+// any other collation, declared on the index key or inherited from the column,
+// would make the unique index treat distinct IDs such as "op" and "OP" as one.
+func verifyBinaryKeys(ctx context.Context, conn *sql.Conn, index string) error {
+	colls, err := queryStrings(ctx, conn,
+		`SELECT coalesce(coll, '') FROM pragma_index_xinfo(?) WHERE key = 1 ORDER BY seqno`, index)
+	if err != nil {
+		return err
+	}
+	for _, coll := range colls {
+		if lowerASCII(coll) != "binary" {
+			return newError(ps.CodeIntegrity, "intent index %q has key collations %v, want BINARY", index, colls)
+		}
 	}
 	return nil
 }

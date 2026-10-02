@@ -313,6 +313,26 @@ func TestSQLiteStore_OpenRefusesUnsupportedSchema(t *testing.T) {
 		}, ps.CodeIntegrity},
 		{"column-wrong-type", rebuildIntents(strings.Replace(sqliteSchema,
 			"operation_id                   TEXT NOT NULL", "operation_id                   INTEGER NOT NULL", 1)), ps.CodeIntegrity},
+		// A non-BINARY key collation lets distinct opaque IDs collide.
+		{"index-nocase-collation", []string{
+			"DROP INDEX intents_operation_id",
+			"CREATE UNIQUE INDEX intents_operation_id ON intents (operation_id COLLATE NOCASE) WHERE origin = 'EXPLICIT'",
+		}, ps.CodeIntegrity},
+		{"index-rtrim-collation", []string{
+			"DROP INDEX intents_run_id",
+			"CREATE UNIQUE INDEX intents_run_id ON intents (run_id COLLATE RTRIM) WHERE run_id <> ''",
+		}, ps.CodeIntegrity},
+		{"index-second-key-nocase-collation", []string{
+			"DROP INDEX intents_auto_key",
+			"CREATE UNIQUE INDEX intents_auto_key ON intents (auto_run_policy_id, input_binding_subject_identity COLLATE NOCASE) WHERE origin = 'AUTOMATIC'",
+		}, ps.CodeIntegrity},
+		// The index inherits a collation declared on the column.
+		{"column-nocase-collation", rebuildIntents(strings.Replace(sqliteSchema,
+			"operation_id                   TEXT NOT NULL", "operation_id                   TEXT COLLATE NOCASE NOT NULL", 1)), ps.CodeIntegrity},
+		{"index-expression-key", []string{
+			"DROP INDEX intents_operation_id",
+			"CREATE UNIQUE INDEX intents_operation_id ON intents (lower(operation_id)) WHERE origin = 'EXPLICIT'",
+		}, ps.CodeIntegrity},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -415,6 +435,66 @@ func TestSQLiteStore_OpenAcceptsEquivalentSchemaText(t *testing.T) {
 	}
 	if after := dbSnapshot(t, db); !reflect.DeepEqual(after, before) {
 		t.Fatalf("open changed the database\nbefore=%q\nafter=%q", before, after)
+	}
+}
+
+// An operation_id index that compares case-insensitively would collapse the
+// distinct explicit IDs "op" and "OP", so the open refuses it and changes
+// nothing. The same index spelled with an explicit COLLATE BINARY opens and
+// keeps both IDs.
+func TestSQLiteStore_OperationIDIndexMustBeBinary(t *testing.T) {
+	cases := []struct {
+		name  string
+		index string
+		opens bool
+	}{
+		{"nocase", "CREATE UNIQUE INDEX intents_operation_id ON intents (operation_id COLLATE NOCASE) WHERE origin = 'EXPLICIT'", false},
+		{"explicit-binary", "CREATE UNIQUE INDEX intents_operation_id ON intents (operation_id COLLATE binary) WHERE origin = 'EXPLICIT'", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			db := openSQLite(t, sqlitePath(t))
+			if _, created, err := newSQLiteStore(t, db).createExplicit(ctx, explicitDraft("op")); err != nil || !created {
+				t.Fatalf("create op: created=%v err=%v", created, err)
+			}
+			for _, stmt := range []string{"DROP INDEX intents_operation_id", tc.index} {
+				if _, err := db.Exec(stmt); err != nil {
+					t.Fatalf("%s: %v", stmt, err)
+				}
+			}
+			before := dbSnapshot(t, db)
+			s, err := NewSQLiteStore(ctx, db)
+			if !tc.opens {
+				if ps.CodeOf(err) != ps.CodeIntegrity || s != nil {
+					detail := ""
+					if s != nil {
+						_, _, cerr := s.createExplicit(ctx, explicitDraft("OP"))
+						detail = fmt.Sprintf("; creating OP then gives %v", cerr)
+					}
+					t.Fatalf("NewSQLiteStore: store=%v err=%v, want %s%s", s, err, ps.CodeIntegrity, detail)
+				}
+				if after := dbSnapshot(t, db); !reflect.DeepEqual(after, before) {
+					t.Fatalf("refused open changed the database\nbefore=%q\nafter=%q", before, after)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("NewSQLiteStore with a BINARY index: %v", err)
+			}
+			if after := dbSnapshot(t, db); !reflect.DeepEqual(after, before) {
+				t.Fatalf("open changed the database\nbefore=%q\nafter=%q", before, after)
+			}
+			if _, created, err := s.createExplicit(ctx, explicitDraft("OP")); err != nil || !created {
+				t.Fatalf("create OP next to op: created=%v err=%v", created, err)
+			}
+			for _, op := range []string{"op", "OP"} {
+				got, found, err := s.LookupExplicit(ctx, op)
+				if err != nil || !found || got.OperationID != op {
+					t.Fatalf("LookupExplicit(%q) = %+v found=%v err=%v", op, got, found, err)
+				}
+			}
+		})
 	}
 }
 
