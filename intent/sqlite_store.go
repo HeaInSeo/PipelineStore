@@ -43,8 +43,19 @@ var _ Store = (*SQLiteStore)(nil)
 // sqliteBusyTimeout is how long a call waits for another writer's lock (ms).
 const sqliteBusyTimeout = 5000
 
+// intentSchemaVersion is the intent table layout this build reads and writes.
+// It is recorded in its own intent_schema_version table rather than PRAGMA
+// user_version, because the database file is shared with the revision store.
+const intentSchemaVersion = 1
+
+const sqliteVersionTable = `
+CREATE TABLE intent_schema_version (
+	singleton INTEGER NOT NULL PRIMARY KEY CHECK (singleton = 1),
+	version   INTEGER NOT NULL
+)`
+
 const sqliteSchema = `
-CREATE TABLE IF NOT EXISTS intents (
+CREATE TABLE intents (
 	intent_id                      TEXT NOT NULL PRIMARY KEY,
 	origin                         TEXT NOT NULL,
 	auto_run_policy_id             TEXT NOT NULL,
@@ -60,30 +71,99 @@ CREATE TABLE IF NOT EXISTS intents (
 	blocker_authorization          TEXT NOT NULL,
 	blocker_materialization_prereq TEXT NOT NULL
 );
-CREATE UNIQUE INDEX IF NOT EXISTS intents_auto_key ON intents (auto_run_policy_id, input_binding_subject_identity)
+CREATE UNIQUE INDEX intents_auto_key ON intents (auto_run_policy_id, input_binding_subject_identity)
 	WHERE origin = 'AUTOMATIC';
-CREATE UNIQUE INDEX IF NOT EXISTS intents_operation_id ON intents (operation_id) WHERE origin = 'EXPLICIT';
-CREATE UNIQUE INDEX IF NOT EXISTS intents_run_id ON intents (run_id) WHERE run_id <> '';
+CREATE UNIQUE INDEX intents_operation_id ON intents (operation_id) WHERE origin = 'EXPLICIT';
+CREATE UNIQUE INDEX intents_run_id ON intents (run_id) WHERE run_id <> '';
 `
+
+// intentObjects are the schema objects sqliteSchema creates.
+const intentObjects = `'intents', 'intents_auto_key', 'intents_operation_id', 'intents_run_id'`
 
 const intentColumns = `intent_id, origin, auto_run_policy_id, auto_run_policy_revision, operation_id,
 	input_binding_subject_identity, pipeline_id, pipeline_revision_id, run_id, admission_epoch,
 	blocker_policy_disable, blocker_campaign_pause, blocker_authorization, blocker_materialization_prereq`
 
-// NewSQLiteStore creates the intent tables in db if needed and returns the
-// store. db must be an SQLite database; the caller owns and closes it.
+// NewSQLiteStore opens the intent store on db and returns it. db must be an
+// SQLite database; the caller owns and closes it.
+//
+// Open safety: a database with no intent objects is initialized at
+// intentSchemaVersion. A database recorded at intentSchemaVersion is used as
+// is. Anything else fails with ps.CodeUnsupportedVersion or ps.CodeIntegrity:
+// a newer or unknown version, intent tables without a version record, or a
+// version record without its tables. Existing intent tables are never dropped,
+// recreated or migrated. Initialization runs in one transaction, so a failed
+// open leaves the database unchanged.
 func NewSQLiteStore(ctx context.Context, db *sql.DB) (*SQLiteStore, error) {
+	return newSQLiteStoreWithFault(ctx, db, nil)
+}
+
+// newSQLiteStoreWithFault is NewSQLiteStore with fault active during schema
+// initialization (tests).
+func newSQLiteStoreWithFault(ctx context.Context, db *sql.DB, fault func(step string) error) (*SQLiteStore, error) {
 	if db == nil {
 		return nil, errors.New("intent: NewSQLiteStore requires a database")
 	}
-	s := &SQLiteStore{db: db}
-	if err := s.write(ctx, func(conn *sql.Conn) error {
-		_, err := conn.ExecContext(ctx, sqliteSchema)
-		return err
-	}); err != nil {
+	s := &SQLiteStore{db: db, fault: fault}
+	if err := s.write(ctx, func(conn *sql.Conn) error { return s.initSchema(ctx, conn) }); err != nil {
 		return nil, fmt.Errorf("intent: init sqlite schema: %w", err)
 	}
+	s.fault = nil
 	return s, nil
+}
+
+// initSchema verifies the recorded intent schema version, or creates the
+// schema on a database that has no intent objects yet.
+func (s *SQLiteStore) initSchema(ctx context.Context, conn *sql.Conn) error {
+	var versioned, objects int
+	if err := conn.QueryRowContext(ctx,
+		`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'intent_schema_version'`).Scan(&versioned); err != nil {
+		return err
+	}
+	if err := conn.QueryRowContext(ctx,
+		`SELECT count(*) FROM sqlite_master WHERE name IN (`+intentObjects+`)`).Scan(&objects); err != nil {
+		return err
+	}
+	if versioned == 0 {
+		if objects != 0 {
+			return newError(ps.CodeUnsupportedVersion, "intent tables exist without a schema version; refusing to adopt them")
+		}
+		return s.createSchema(ctx, conn)
+	}
+	var version int64
+	err := conn.QueryRowContext(ctx, `SELECT version FROM intent_schema_version WHERE singleton = 1`).Scan(&version)
+	if errors.Is(err, sql.ErrNoRows) {
+		return newError(ps.CodeIntegrity, "intent schema version table has no version record")
+	}
+	if err != nil {
+		return err
+	}
+	if version != intentSchemaVersion {
+		return newError(ps.CodeUnsupportedVersion, "intent schema version %d is not supported (this build supports %d)", version, intentSchemaVersion)
+	}
+	if objects != 4 {
+		return newError(ps.CodeIntegrity, "intent schema version %d is recorded but %d of 4 intent objects exist", version, objects)
+	}
+	return nil
+}
+
+func (s *SQLiteStore) createSchema(ctx context.Context, conn *sql.Conn) error {
+	if _, err := conn.ExecContext(ctx, sqliteVersionTable); err != nil {
+		return err
+	}
+	if err := s.inject("schema-version-table"); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, sqliteSchema); err != nil {
+		return err
+	}
+	if err := s.inject("schema-tables"); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, `INSERT INTO intent_schema_version (singleton, version) VALUES (1, ?)`, intentSchemaVersion); err != nil {
+		return err
+	}
+	return s.inject("schema-version-record")
 }
 
 func (s *SQLiteStore) inject(step string) error {

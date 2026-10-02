@@ -3,7 +3,10 @@ package intent
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 
@@ -194,6 +197,126 @@ func TestSQLiteStore_PolicyLogFailsClosed(t *testing.T) {
 	}
 	if _, found, err := s.LookupAutomatic(ctx, "policy-1", "subject-1"); err != nil || found {
 		t.Fatalf("fail-closed admission wrote an intent: found=%v err=%v", found, err)
+	}
+}
+
+// dbSnapshot lists every schema object of db with its SQL and, for tables, its
+// row count, so a refused open can be checked for zero mutation.
+func dbSnapshot(t *testing.T, db *sql.DB) []string {
+	t.Helper()
+	rows, err := db.Query(`SELECT type, name, coalesce(sql, '') FROM sqlite_master ORDER BY type, name`)
+	if err != nil {
+		t.Fatalf("read schema: %v", err)
+	}
+	var snap, tables []string
+	for rows.Next() {
+		var typ, name, ddl string
+		if err := rows.Scan(&typ, &name, &ddl); err != nil {
+			t.Fatalf("scan schema: %v", err)
+		}
+		snap = append(snap, typ+" "+name+" "+ddl)
+		if typ == "table" {
+			tables = append(tables, name)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatalf("close schema rows: %v", err)
+	}
+	for _, name := range tables {
+		var n int
+		if err := db.QueryRow(`SELECT count(*) FROM "` + name + `"`).Scan(&n); err != nil {
+			t.Fatalf("count %s: %v", name, err)
+		}
+		snap = append(snap, fmt.Sprintf("rows %s=%d", name, n))
+	}
+	var version sql.NullInt64
+	if err := db.QueryRow(`SELECT version FROM intent_schema_version`).Scan(&version); err == nil {
+		snap = append(snap, fmt.Sprintf("intent_schema_version=%d", version.Int64))
+	}
+	return snap
+}
+
+// A newer, unknown or missing version record, intent tables without a version
+// record, or a version record without its tables all fail the open with an
+// explicit code and leave the database exactly as it was: nothing is dropped,
+// recreated, migrated or stamped.
+func TestSQLiteStore_OpenRefusesUnsupportedSchema(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup []string
+		code  ps.Code
+	}{
+		{"newer-version", []string{"UPDATE intent_schema_version SET version = 2"}, ps.CodeUnsupportedVersion},
+		{"unknown-version", []string{"UPDATE intent_schema_version SET version = 0"}, ps.CodeUnsupportedVersion},
+		{"missing-version-record", []string{"DELETE FROM intent_schema_version"}, ps.CodeIntegrity},
+		{"unversioned-intent-tables", []string{"DROP TABLE intent_schema_version"}, ps.CodeUnsupportedVersion},
+		{"version-without-tables", []string{"DROP TABLE intents"}, ps.CodeIntegrity},
+		{"version-with-partial-indexes", []string{"DROP INDEX intents_run_id"}, ps.CodeIntegrity},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			path := sqlitePath(t)
+			db := openSQLite(t, path)
+			mustCreateAutomatic(t, newSQLiteStore(t, db), "subject-1")
+			for _, stmt := range tc.setup {
+				if _, err := db.Exec(stmt); err != nil {
+					t.Fatalf("%s: %v", stmt, err)
+				}
+			}
+			before := dbSnapshot(t, db)
+			s, err := NewSQLiteStore(ctx, db)
+			if ps.CodeOf(err) != tc.code || s != nil {
+				t.Fatalf("NewSQLiteStore: store=%v err=%v, want %s", s, err, tc.code)
+			}
+			if after := dbSnapshot(t, db); !reflect.DeepEqual(after, before) {
+				t.Fatalf("refused open changed the database\nbefore=%q\nafter=%q", before, after)
+			}
+		})
+	}
+}
+
+// A failure at any step of schema initialization fails the open and leaves no
+// intent object behind; a later open then initializes cleanly.
+func TestSQLiteStore_InitFailureLeavesNoSchema(t *testing.T) {
+	for _, step := range []string{"schema-version-table", "schema-tables", "schema-version-record"} {
+		t.Run(step, func(t *testing.T) {
+			ctx := context.Background()
+			db := openSQLite(t, sqlitePath(t))
+			boom := errors.New("injected init fault")
+			s, err := newSQLiteStoreWithFault(ctx, db, func(got string) error {
+				if got == step {
+					return boom
+				}
+				return nil
+			})
+			if !errors.Is(err, boom) || s != nil {
+				t.Fatalf("open with fault at %s: store=%v err=%v, want %v", step, s, err, boom)
+			}
+			if snap := dbSnapshot(t, db); len(snap) != 0 {
+				t.Fatalf("failed init left schema behind: %q", snap)
+			}
+			mustCreateAutomatic(t, newSQLiteStore(t, db), "subject-1")
+		})
+	}
+}
+
+// Opening the current version again, on the same or a new handle, keeps the
+// stored intents and the single version record.
+func TestSQLiteStore_ReopenCurrentVersionKeepsData(t *testing.T) {
+	ctx := context.Background()
+	path := sqlitePath(t)
+	db := openSQLite(t, path)
+	in := mustCreateAutomatic(t, newSQLiteStore(t, db), "subject-1")
+	before := dbSnapshot(t, db)
+	newSQLiteStore(t, db)
+	r := reopenSQLite(t, db, path)
+	got, found, err := r.LookupAutomatic(ctx, in.AutoRunPolicyID, "subject-1")
+	if err != nil || !found || got != in {
+		t.Fatalf("intent after reopen: %+v found=%v err=%v, want %+v", got, found, err, in)
+	}
+	if after := dbSnapshot(t, r.db); !reflect.DeepEqual(after, before) {
+		t.Fatalf("reopen changed the database\nbefore=%q\nafter=%q", before, after)
 	}
 }
 
