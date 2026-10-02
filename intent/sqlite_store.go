@@ -244,11 +244,14 @@ func verifySchemaObjects(ctx context.Context, conn *sql.Conn) error {
 // sqlToken is one token of SQL text. Keywords and identifiers (quoted or not)
 // are case-folded and unquoted, string literals keep their exact quoted text,
 // and the operator spellings "!=" and "==" become "<>" and "=". word marks an
-// unquoted keyword or identifier and punct an operator or punctuation.
+// unquoted keyword or identifier, literal a string literal and punct an
+// operator or punctuation. Token class is part of identity: a quoted
+// identifier whose name spells a string literal never equals that literal.
 type sqlToken struct {
-	text  string
-	word  bool
-	punct bool
+	text    string
+	word    bool
+	literal bool
+	punct   bool
 }
 
 // sqlTokens splits SQL text into tokens, dropping whitespace and comments, so
@@ -283,7 +286,7 @@ func sqlTokens(text string) ([]sqlToken, error) {
 			if err != nil {
 				return nil, err
 			}
-			out = append(out, sqlToken{text: text[i:end]})
+			out = append(out, sqlToken{text: text[i:end], literal: true})
 			i = end
 		case c == '"' || c == '`' || c == '[':
 			closer := c
@@ -411,7 +414,7 @@ func equalTokens(a, b []sqlToken) bool {
 		return false
 	}
 	for i := range a {
-		if a[i].text != b[i].text || a[i].punct != b[i].punct {
+		if a[i].text != b[i].text || a[i].literal != b[i].literal || a[i].punct != b[i].punct {
 			return false
 		}
 	}

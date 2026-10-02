@@ -301,6 +301,16 @@ func TestSQLiteStore_OpenRefusesUnsupportedSchema(t *testing.T) {
 			"DROP INDEX intents_operation_id",
 			"CREATE UNIQUE INDEX intents_operation_id ON intents (operation_id) WHERE origin = 'explicit'",
 		}, ps.CodeIntegrity},
+		// A quoted identifier named '' is not the empty string literal.
+		{"index-predicate-quoted-identifier-lookalike", []string{
+			"DROP INDEX intents_run_id",
+			`CREATE UNIQUE INDEX intents_run_id ON intents (run_id) WHERE run_id <> "''"`,
+		}, ps.CodeIntegrity},
+		// A comment only separates tokens: the clause after it still counts.
+		{"index-predicate-clause-after-comment", []string{
+			"DROP INDEX intents_operation_id",
+			"CREATE UNIQUE INDEX intents_operation_id ON intents (operation_id) WHERE origin = 'EXPLICIT' /* explicit */ AND run_id <> ''",
+		}, ps.CodeIntegrity},
 		{"column-wrong-type", rebuildIntents(strings.Replace(sqliteSchema,
 			"operation_id                   TEXT NOT NULL", "operation_id                   INTEGER NOT NULL", 1)), ps.CodeIntegrity},
 	}
@@ -383,7 +393,7 @@ func TestSQLiteStore_OpenAcceptsEquivalentSchemaText(t *testing.T) {
 	stmts := rebuildIntents(strings.NewReplacer("TEXT NOT NULL", "text not null", "INTEGER NOT NULL", "Integer NOT NULL").Replace(sqliteSchema))
 	stmts = append(stmts,
 		"DROP INDEX intents_run_id",
-		"create unique index intents_run_id on intents(run_id) where run_id!=''",
+		"create unique index intents_run_id on intents(run_id) where run_id/* a */!=-- b\n''",
 		"DROP INDEX intents_operation_id",
 		"CREATE UNIQUE INDEX \"intents_operation_id\" ON intents ([operation_id]) WHERE ( (\"ORIGIN\"=='EXPLICIT') ) -- explicit ledger",
 		"DROP INDEX intents_auto_key",
