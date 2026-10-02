@@ -144,7 +144,150 @@ func (s *SQLiteStore) initSchema(ctx context.Context, conn *sql.Conn) error {
 	if objects != 4 {
 		return newError(ps.CodeIntegrity, "intent schema version %d is recorded but %d of 4 intent objects exist", version, objects)
 	}
+	return verifySchemaObjects(ctx, conn)
+}
+
+// intentIndexes are the unique partial indexes sqliteSchema creates on
+// intents, with their key columns in order.
+var intentIndexes = []struct {
+	name    string
+	columns []string
+}{
+	{"intents_auto_key", []string{"auto_run_policy_id", "input_binding_subject_identity"}},
+	{"intents_operation_id", []string{"operation_id"}},
+	{"intents_run_id", []string{"run_id"}},
+}
+
+// verifySchemaObjects checks that the intent objects of a version-1 database
+// are what sqliteSchema creates, using SQLite's schema metadata rather than
+// the stored SQL text: intents is a table with exactly the intent columns
+// (all NOT NULL, intent_id the primary key), and each required index is a
+// unique partial index on intents over its key columns. A mismatch fails with
+// ps.CodeIntegrity; nothing is repaired.
+func verifySchemaObjects(ctx context.Context, conn *sql.Conn) error {
+	objectOn := func(name, wantType string) error {
+		var typ, tbl string
+		if err := conn.QueryRowContext(ctx,
+			`SELECT type, tbl_name FROM sqlite_master WHERE name = ?`, name).Scan(&typ, &tbl); err != nil {
+			return err
+		}
+		if typ != wantType || tbl != "intents" {
+			return newError(ps.CodeIntegrity, "intent schema object %q is a %s on %q, want a %s on \"intents\"", name, typ, tbl, wantType)
+		}
+		return nil
+	}
+	if err := objectOn("intents", "table"); err != nil {
+		return err
+	}
+	if err := verifyIntentColumns(ctx, conn); err != nil {
+		return err
+	}
+	type indexMeta struct{ unique, partial bool }
+	indexes := map[string]indexMeta{}
+	rows, err := conn.QueryContext(ctx, `SELECT name, "unique", partial FROM pragma_index_list('intents')`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var (
+			name            string
+			unique, partial int
+		)
+		if err := rows.Scan(&name, &unique, &partial); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		indexes[name] = indexMeta{unique: unique == 1, partial: partial == 1}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, want := range intentIndexes {
+		if err := objectOn(want.name, "index"); err != nil {
+			return err
+		}
+		meta := indexes[want.name]
+		if !meta.unique || !meta.partial {
+			return newError(ps.CodeIntegrity, "intent index %q is unique=%v partial=%v, want a unique partial index", want.name, meta.unique, meta.partial)
+		}
+		cols, err := queryStrings(ctx, conn, `SELECT name FROM pragma_index_info(?) ORDER BY seqno`, want.name)
+		if err != nil {
+			return err
+		}
+		if !equalStrings(cols, want.columns) {
+			return newError(ps.CodeIntegrity, "intent index %q covers %v, want %v", want.name, cols, want.columns)
+		}
+	}
 	return nil
+}
+
+// intentColumnNames are the intents columns in table order (intentColumns as a
+// list).
+var intentColumnNames = []string{
+	"intent_id", "origin", "auto_run_policy_id", "auto_run_policy_revision", "operation_id",
+	"input_binding_subject_identity", "pipeline_id", "pipeline_revision_id", "run_id", "admission_epoch",
+	"blocker_policy_disable", "blocker_campaign_pause", "blocker_authorization", "blocker_materialization_prereq",
+}
+
+// verifyIntentColumns checks the intents table has exactly the intent columns
+// in order, all NOT NULL, with intent_id as the only primary key column.
+func verifyIntentColumns(ctx context.Context, conn *sql.Conn) error {
+	want := intentColumnNames
+	rows, err := conn.QueryContext(ctx, `SELECT name, "notnull", pk FROM pragma_table_info('intents') ORDER BY cid`)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+	var got []string
+	for rows.Next() {
+		var (
+			name        string
+			notNull, pk int
+		)
+		if err := rows.Scan(&name, &notNull, &pk); err != nil {
+			return err
+		}
+		if notNull != 1 || (pk != 0) != (name == "intent_id") {
+			return newError(ps.CodeIntegrity, "intents column %q has notnull=%d pk=%d", name, notNull, pk)
+		}
+		got = append(got, name)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if !equalStrings(got, want) {
+		return newError(ps.CodeIntegrity, "intents columns are %v, want %v", got, want)
+	}
+	return nil
+}
+
+func queryStrings(ctx context.Context, conn *sql.Conn, query string, args ...any) ([]string, error) {
+	rows, err := conn.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *SQLiteStore) createSchema(ctx context.Context, conn *sql.Conn) error {

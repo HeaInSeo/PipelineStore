@@ -252,6 +252,32 @@ func TestSQLiteStore_OpenRefusesUnsupportedSchema(t *testing.T) {
 		{"unversioned-intent-tables", []string{"DROP TABLE intent_schema_version"}, ps.CodeUnsupportedVersion},
 		{"version-without-tables", []string{"DROP TABLE intents"}, ps.CodeIntegrity},
 		{"version-with-partial-indexes", []string{"DROP INDEX intents_run_id"}, ps.CodeIntegrity},
+		{"nonunique-index", []string{
+			"DROP INDEX intents_run_id",
+			"CREATE INDEX intents_run_id ON intents (run_id) WHERE run_id <> ''",
+		}, ps.CodeIntegrity},
+		{"non-partial-index", []string{
+			"DROP INDEX intents_operation_id",
+			"CREATE UNIQUE INDEX intents_operation_id ON intents (operation_id)",
+		}, ps.CodeIntegrity},
+		{"index-wrong-columns", []string{
+			"DROP INDEX intents_auto_key",
+			"CREATE UNIQUE INDEX intents_auto_key ON intents (auto_run_policy_id) WHERE origin = 'AUTOMATIC'",
+		}, ps.CodeIntegrity},
+		{"index-replaced-by-view", []string{
+			"DROP INDEX intents_run_id",
+			"CREATE VIEW intents_run_id AS SELECT run_id FROM intents",
+		}, ps.CodeIntegrity},
+		{"index-on-other-table", []string{
+			"DROP INDEX intents_run_id",
+			"CREATE TABLE intents_other (run_id TEXT NOT NULL)",
+			"CREATE UNIQUE INDEX intents_run_id ON intents_other (run_id) WHERE run_id <> ''",
+		}, ps.CodeIntegrity},
+		{"table-replaced-by-view", []string{
+			"ALTER TABLE intents RENAME TO intents_renamed",
+			"CREATE VIEW intents AS SELECT * FROM intents_renamed",
+		}, ps.CodeIntegrity},
+		{"table-extra-column", []string{"ALTER TABLE intents ADD COLUMN extra TEXT NOT NULL DEFAULT ''"}, ps.CodeIntegrity},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -317,6 +343,35 @@ func TestSQLiteStore_ReopenCurrentVersionKeepsData(t *testing.T) {
 	}
 	if after := dbSnapshot(t, r.db); !reflect.DeepEqual(after, before) {
 		t.Fatalf("reopen changed the database\nbefore=%q\nafter=%q", before, after)
+	}
+}
+
+// Schema verification reads SQLite metadata, not the stored SQL text: a
+// version-1 database whose objects are equivalent but written differently
+// still opens, unchanged.
+func TestSQLiteStore_OpenAcceptsEquivalentSchemaText(t *testing.T) {
+	ctx := context.Background()
+	db := openSQLite(t, sqlitePath(t))
+	in := mustCreateAutomatic(t, newSQLiteStore(t, db), "subject-1")
+	for _, stmt := range []string{
+		"DROP INDEX intents_run_id",
+		"create unique index intents_run_id on intents(run_id) where run_id!=''",
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	before := dbSnapshot(t, db)
+	s, err := NewSQLiteStore(ctx, db)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore on an equivalent schema: %v", err)
+	}
+	got, found, err := s.LookupAutomatic(ctx, in.AutoRunPolicyID, "subject-1")
+	if err != nil || !found || got != in {
+		t.Fatalf("intent after open: %+v found=%v err=%v, want %+v", got, found, err, in)
+	}
+	if after := dbSnapshot(t, db); !reflect.DeepEqual(after, before) {
+		t.Fatalf("open changed the database\nbefore=%q\nafter=%q", before, after)
 	}
 }
 
