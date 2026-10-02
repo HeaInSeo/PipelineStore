@@ -561,6 +561,23 @@ func TestSQLiteStore_NocaseIdentityColumnsDoNotCollapse(t *testing.T) {
 		t.Fatalf("create SUBJECT-1 next to subject-1: %+v created=%v err=%v", autoUpper, created, err)
 	}
 
+	// Same subject, policy ID differing only in case: only the policy predicate
+	// can tell the two keys apart.
+	if got, found, err := s.LookupAutomatic(ctx, "POLICY-1", "subject-1"); err != nil || found {
+		t.Fatalf("LookupAutomatic(POLICY-1) before create = %+v found=%v err=%v, want not found", got, found, err)
+	}
+	policyDraft := automaticDraft("subject-1")
+	policyDraft.AutoRunPolicyID = "POLICY-1"
+	policyUpper, created, err := s.createAutomatic(ctx, policyDraft)
+	if err != nil || !created || policyUpper.ID == auto.ID || policyUpper.AutoRunPolicyID != "POLICY-1" {
+		t.Fatalf("create POLICY-1 next to policy-1: %+v created=%v err=%v", policyUpper, created, err)
+	}
+	for _, want := range []Intent{auto, policyUpper} {
+		if got, found, err := s.LookupAutomatic(ctx, want.AutoRunPolicyID, "subject-1"); err != nil || !found || got.ID != want.ID {
+			t.Fatalf("LookupAutomatic(%q) = %+v found=%v err=%v, want %s", want.AutoRunPolicyID, got, found, err, want.ID)
+		}
+	}
+
 	if _, err := s.AttachRunID(ctx, autoUpper.ID, "RUN"); err != nil {
 		t.Fatalf("attach RUN next to run: %v", err)
 	}
@@ -569,6 +586,50 @@ func TestSQLiteStore_NocaseIdentityColumnsDoNotCollapse(t *testing.T) {
 	}
 	if got := mustGetIntent(t, s, autoUpper.ID); got.RunID != "RUN" {
 		t.Fatalf("intent %s RunID = %q, want RUN", autoUpper.ID, got.RunID)
+	}
+}
+
+// An intent_id column declared NOCASE whose primary key is explicitly BINARY
+// passes schema verification. Get and AttachRunID pin BINARY on intent_id, so a
+// case variant of a stored ID is not found and the stored intent is unchanged.
+func TestSQLiteStore_NocaseIntentIDColumnWithBinaryPrimaryKey(t *testing.T) {
+	ctx := context.Background()
+	db := openSQLite(t, sqlitePath(t))
+	in := mustCreateAutomatic(t, newSQLiteStore(t, db), "subject-1")
+	const id ID = "intent-lower"
+	if _, err := db.Exec("UPDATE intents SET intent_id = ? WHERE intent_id = ?", string(id), string(in.ID)); err != nil {
+		t.Fatalf("set intent_id: %v", err)
+	}
+	schema := strings.NewReplacer(
+		"intent_id                      TEXT NOT NULL PRIMARY KEY,", "intent_id                      TEXT COLLATE NOCASE NOT NULL,",
+		"blocker_materialization_prereq TEXT NOT NULL\n", "blocker_materialization_prereq TEXT NOT NULL,\n\tPRIMARY KEY (intent_id COLLATE BINARY)\n",
+	).Replace(sqliteSchema)
+	for _, stmt := range rebuildIntents(schema) {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	before := dbSnapshot(t, db)
+	s, err := NewSQLiteStore(ctx, db)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore with a NOCASE intent_id and a BINARY primary key: %v", err)
+	}
+	if after := dbSnapshot(t, db); !reflect.DeepEqual(after, before) {
+		t.Fatalf("open changed the database\nbefore=%q\nafter=%q", before, after)
+	}
+
+	const upper ID = "INTENT-LOWER"
+	if got, err := s.Get(ctx, upper); ps.CodeOf(err) != ps.CodeNotFound {
+		t.Fatalf("Get(%s) = %+v err=%v, want %s", upper, got, err, ps.CodeNotFound)
+	}
+	if got, err := s.AttachRunID(ctx, upper, "run"); ps.CodeOf(err) != ps.CodeNotFound {
+		t.Fatalf("AttachRunID(%s) = %+v err=%v, want %s", upper, got, err, ps.CodeNotFound)
+	}
+	if got := mustGetIntent(t, s, id); got.ID != id || got.RunID != "" {
+		t.Fatalf("stored intent after case-variant calls = %+v, want ID %s without RunID", got, id)
+	}
+	if after := dbSnapshot(t, db); !reflect.DeepEqual(after, before) {
+		t.Fatalf("case-variant calls changed the database\nbefore=%q\nafter=%q", before, after)
 	}
 }
 
