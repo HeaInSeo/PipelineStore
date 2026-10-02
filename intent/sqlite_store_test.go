@@ -329,6 +329,9 @@ func TestSQLiteStore_OpenRefusesUnsupportedSchema(t *testing.T) {
 		// The index inherits a collation declared on the column.
 		{"column-nocase-collation", rebuildIntents(strings.Replace(sqliteSchema,
 			"operation_id                   TEXT NOT NULL", "operation_id                   TEXT COLLATE NOCASE NOT NULL", 1)), ps.CodeIntegrity},
+		// The primary key index inherits intent_id's collation.
+		{"intent-id-nocase-collation", rebuildIntents(strings.Replace(sqliteSchema,
+			"intent_id                      TEXT NOT NULL PRIMARY KEY", "intent_id                      TEXT COLLATE NOCASE NOT NULL PRIMARY KEY", 1)), ps.CodeIntegrity},
 		{"index-expression-key", []string{
 			"DROP INDEX intents_operation_id",
 			"CREATE UNIQUE INDEX intents_operation_id ON intents (lower(operation_id)) WHERE origin = 'EXPLICIT'",
@@ -495,6 +498,77 @@ func TestSQLiteStore_OperationIDIndexMustBeBinary(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Identity columns declared NOCASE, with every required index explicitly
+// BINARY, pass schema verification. The identity predicates pin BINARY, so
+// "op"/"OP", "subject-1"/"SUBJECT-1" and "run"/"RUN" stay distinct identities
+// instead of replaying or conflicting with the stored one.
+func TestSQLiteStore_NocaseIdentityColumnsDoNotCollapse(t *testing.T) {
+	ctx := context.Background()
+	db := openSQLite(t, sqlitePath(t))
+	s := newSQLiteStore(t, db)
+	explicit, created, err := s.createExplicit(ctx, explicitDraft("op"))
+	if err != nil || !created {
+		t.Fatalf("create op: created=%v err=%v", created, err)
+	}
+	auto := mustCreateAutomatic(t, s, "subject-1")
+	if _, err := s.AttachRunID(ctx, auto.ID, "run"); err != nil {
+		t.Fatalf("attach run: %v", err)
+	}
+	schema := strings.NewReplacer(
+		"operation_id                   TEXT NOT NULL", "operation_id                   TEXT COLLATE NOCASE NOT NULL",
+		"auto_run_policy_id             TEXT NOT NULL", "auto_run_policy_id             TEXT COLLATE NOCASE NOT NULL",
+		"input_binding_subject_identity TEXT NOT NULL", "input_binding_subject_identity TEXT COLLATE NOCASE NOT NULL",
+		"run_id                         TEXT NOT NULL", "run_id                         TEXT COLLATE NOCASE NOT NULL",
+		"(auto_run_policy_id, input_binding_subject_identity)", "(auto_run_policy_id COLLATE BINARY, input_binding_subject_identity COLLATE BINARY)",
+		"(operation_id)", "(operation_id COLLATE BINARY)",
+		"(run_id)", "(run_id COLLATE BINARY)",
+	).Replace(sqliteSchema)
+	for _, stmt := range rebuildIntents(schema) {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	before := dbSnapshot(t, db)
+	s, err = NewSQLiteStore(ctx, db)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore with NOCASE columns and BINARY indexes: %v", err)
+	}
+	if after := dbSnapshot(t, db); !reflect.DeepEqual(after, before) {
+		t.Fatalf("open changed the database\nbefore=%q\nafter=%q", before, after)
+	}
+
+	if got, found, err := s.LookupExplicit(ctx, "OP"); err != nil || found {
+		t.Fatalf("LookupExplicit(OP) before create = %+v found=%v err=%v, want not found", got, found, err)
+	}
+	upper, created, err := s.createExplicit(ctx, explicitDraft("OP"))
+	if err != nil || !created || upper.ID == explicit.ID || upper.OperationID != "OP" {
+		t.Fatalf("create OP next to op: %+v created=%v err=%v", upper, created, err)
+	}
+	for _, want := range []Intent{explicit, upper} {
+		if got, found, err := s.LookupExplicit(ctx, want.OperationID); err != nil || !found || got.ID != want.ID {
+			t.Fatalf("LookupExplicit(%q) = %+v found=%v err=%v, want %s", want.OperationID, got, found, err, want.ID)
+		}
+	}
+
+	if got, found, err := s.LookupAutomatic(ctx, auto.AutoRunPolicyID, "SUBJECT-1"); err != nil || found {
+		t.Fatalf("LookupAutomatic(SUBJECT-1) before create = %+v found=%v err=%v, want not found", got, found, err)
+	}
+	autoUpper, created, err := s.createAutomatic(ctx, automaticDraft("SUBJECT-1"))
+	if err != nil || !created || autoUpper.ID == auto.ID {
+		t.Fatalf("create SUBJECT-1 next to subject-1: %+v created=%v err=%v", autoUpper, created, err)
+	}
+
+	if _, err := s.AttachRunID(ctx, autoUpper.ID, "RUN"); err != nil {
+		t.Fatalf("attach RUN next to run: %v", err)
+	}
+	if got := mustGetIntent(t, s, auto.ID); got.RunID != "run" {
+		t.Fatalf("intent %s RunID = %q, want run", auto.ID, got.RunID)
+	}
+	if got := mustGetIntent(t, s, autoUpper.ID); got.RunID != "RUN" {
+		t.Fatalf("intent %s RunID = %q, want RUN", autoUpper.ID, got.RunID)
 	}
 }
 

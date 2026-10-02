@@ -163,9 +163,11 @@ var intentIndexes = []struct {
 // are what sqliteSchema creates, using SQLite's schema metadata rather than
 // the stored SQL text: intents is a table with exactly the intent columns
 // (declared types as in sqliteSchema, all NOT NULL, intent_id the primary
-// key), and each required index is a unique partial index on intents over its
-// key columns, each compared with BINARY collation (see verifyBinaryKeys),
-// whose WHERE predicate is the expected one. SQLite exposes the
+// key, its index keyed with BINARY collation), and each required index is a
+// unique partial index on intents over its key columns, each compared with
+// BINARY collation (see verifyBinaryKeys), whose WHERE predicate is the
+// expected one. Other column collations are not read; the identity predicates
+// pin BINARY instead (see whereID). SQLite exposes the
 // predicate only inside the stored CREATE INDEX text, so the predicate alone is
 // compared token by token (see indexPredicate); the rest of the text is not. A
 // mismatch fails with ps.CodeIntegrity; nothing is repaired.
@@ -243,7 +245,15 @@ func verifySchemaObjects(ctx context.Context, conn *sql.Conn) error {
 			return newError(ps.CodeIntegrity, "intent index %q has predicate %v, want %q", want.name, tokenTexts(got), want.where)
 		}
 	}
-	return nil
+	// The primary key's index inherits intent_id's declared collation.
+	pks, err := queryStrings(ctx, conn, `SELECT name FROM pragma_index_list('intents') WHERE origin = 'pk'`)
+	if err != nil {
+		return err
+	}
+	if len(pks) != 1 {
+		return newError(ps.CodeIntegrity, "intents has %d primary key indexes, want 1", len(pks))
+	}
+	return verifyBinaryKeys(ctx, conn, pks[0])
 }
 
 // sqlToken is one token of SQL text. Keywords and identifiers (quoted or not)
@@ -657,11 +667,15 @@ func insertIntent(ctx context.Context, conn *sql.Conn, in Intent) error {
 	return nil
 }
 
+// Identity predicates pin BINARY: an equality uses the column's declared
+// collation unless one operand names another, and verifySchemaObjects checks
+// the index keys, not every column declaration. A column declared NOCASE must
+// still never match "OP" to a stored "op".
 const (
-	whereAuto     = "origin = 'AUTOMATIC' AND auto_run_policy_id = ? AND input_binding_subject_identity = ?"
-	whereExplicit = "origin = 'EXPLICIT' AND operation_id = ?"
-	whereID       = "intent_id = ?"
-	whereRunID    = "run_id = ?"
+	whereAuto     = "origin = 'AUTOMATIC' AND auto_run_policy_id COLLATE BINARY = ? AND input_binding_subject_identity COLLATE BINARY = ?"
+	whereExplicit = "origin = 'EXPLICIT' AND operation_id COLLATE BINARY = ?"
+	whereID       = "intent_id COLLATE BINARY = ?"
+	whereRunID    = "run_id COLLATE BINARY = ?"
 )
 
 // LookupAutomatic implements Store.
@@ -772,7 +786,7 @@ func (s *SQLiteStore) AttachRunID(ctx context.Context, id ID, run RunID) (out In
 		if err := s.inject(stepRunIndexStaged); err != nil {
 			return err
 		}
-		if _, err := conn.ExecContext(ctx, "UPDATE intents SET run_id = ? WHERE intent_id = ?", string(run), string(id)); err != nil {
+		if _, err := conn.ExecContext(ctx, "UPDATE intents SET run_id = ? WHERE "+whereID, string(run), string(id)); err != nil {
 			return fmt.Errorf("intent: attach RunID: %w", err)
 		}
 		if err := s.inject(stepIntentStaged); err != nil {
@@ -837,7 +851,7 @@ func (s *SQLiteStore) UpdateBlocker(ctx context.Context, id ID, owner BlockerOwn
 		if err := s.inject(stepBlockerStaged); err != nil {
 			return err
 		}
-		if _, err := conn.ExecContext(ctx, "UPDATE intents SET "+column+" = ? WHERE intent_id = ?", string(state), string(id)); err != nil {
+		if _, err := conn.ExecContext(ctx, "UPDATE intents SET "+column+" = ? WHERE "+whereID, string(state), string(id)); err != nil {
 			return fmt.Errorf("intent: update blocker: %w", err)
 		}
 		*slot = state
