@@ -148,22 +148,26 @@ func (s *SQLiteStore) initSchema(ctx context.Context, conn *sql.Conn) error {
 }
 
 // intentIndexes are the unique partial indexes sqliteSchema creates on
-// intents, with their key columns in order.
+// intents, with their key columns in order and their WHERE predicate.
 var intentIndexes = []struct {
 	name    string
 	columns []string
+	where   string
 }{
-	{"intents_auto_key", []string{"auto_run_policy_id", "input_binding_subject_identity"}},
-	{"intents_operation_id", []string{"operation_id"}},
-	{"intents_run_id", []string{"run_id"}},
+	{"intents_auto_key", []string{"auto_run_policy_id", "input_binding_subject_identity"}, "origin = 'AUTOMATIC'"},
+	{"intents_operation_id", []string{"operation_id"}, "origin = 'EXPLICIT'"},
+	{"intents_run_id", []string{"run_id"}, "run_id <> ''"},
 }
 
 // verifySchemaObjects checks that the intent objects of a version-1 database
 // are what sqliteSchema creates, using SQLite's schema metadata rather than
 // the stored SQL text: intents is a table with exactly the intent columns
-// (all NOT NULL, intent_id the primary key), and each required index is a
-// unique partial index on intents over its key columns. A mismatch fails with
-// ps.CodeIntegrity; nothing is repaired.
+// (declared types as in sqliteSchema, all NOT NULL, intent_id the primary
+// key), and each required index is a unique partial index on intents over its
+// key columns whose WHERE predicate is the expected one. SQLite exposes the
+// predicate only inside the stored CREATE INDEX text, so the predicate alone is
+// compared token by token (see indexPredicate); the rest of the text is not. A
+// mismatch fails with ps.CodeIntegrity; nothing is repaired.
 func verifySchemaObjects(ctx context.Context, conn *sql.Conn) error {
 	objectOn := func(name, wantType string) error {
 		var typ, tbl string
@@ -217,8 +221,209 @@ func verifySchemaObjects(ctx context.Context, conn *sql.Conn) error {
 		if !equalStrings(cols, want.columns) {
 			return newError(ps.CodeIntegrity, "intent index %q covers %v, want %v", want.name, cols, want.columns)
 		}
+		var ddl string
+		if err := conn.QueryRowContext(ctx,
+			`SELECT coalesce(sql, '') FROM sqlite_master WHERE name = ?`, want.name).Scan(&ddl); err != nil {
+			return err
+		}
+		got, err := indexPredicate(ddl)
+		if err != nil {
+			return newError(ps.CodeIntegrity, "intent index %q: %v", want.name, err)
+		}
+		expected, err := sqlTokens(want.where)
+		if err != nil {
+			return err
+		}
+		if !equalTokens(got, expected) {
+			return newError(ps.CodeIntegrity, "intent index %q has predicate %v, want %q", want.name, tokenTexts(got), want.where)
+		}
 	}
 	return nil
+}
+
+// sqlToken is one token of SQL text. Keywords and identifiers (quoted or not)
+// are case-folded and unquoted, string literals keep their exact quoted text,
+// and the operator spellings "!=" and "==" become "<>" and "=". word marks an
+// unquoted keyword or identifier and punct an operator or punctuation.
+type sqlToken struct {
+	text  string
+	word  bool
+	punct bool
+}
+
+// sqlTokens splits SQL text into tokens, dropping whitespace and comments, so
+// that two spellings of the same expression compare equal. Case folding is
+// ASCII-only, as for SQLite identifiers.
+func sqlTokens(text string) ([]sqlToken, error) {
+	var out []sqlToken
+	for i := 0; i < len(text); {
+		c := text[i]
+		next := byte(0)
+		if i+1 < len(text) {
+			next = text[i+1]
+		}
+		switch {
+		case c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v':
+			i++
+		case c == '-' && next == '-':
+			for i < len(text) && text[i] != '\n' {
+				i++
+			}
+		case c == '/' && next == '*':
+			end := i + 2
+			for end+1 < len(text) && (text[end] != '*' || text[end+1] != '/') {
+				end++
+			}
+			if end+1 >= len(text) {
+				return nil, errors.New("unterminated comment in schema SQL")
+			}
+			i = end + 2
+		case c == '\'':
+			end, err := quotedEnd(text, i, '\'')
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, sqlToken{text: text[i:end]})
+			i = end
+		case c == '"' || c == '`' || c == '[':
+			closer := c
+			if c == '[' {
+				closer = ']'
+			}
+			end, err := quotedEnd(text, i, closer)
+			if err != nil {
+				return nil, err
+			}
+			var name []byte
+			for j := i + 1; j < end-1; j++ {
+				name = append(name, text[j])
+				if closer != ']' && text[j] == closer {
+					j++ // doubled closer is one escaped closer
+				}
+			}
+			out = append(out, sqlToken{text: lowerASCII(string(name))})
+			i = end
+		case isWordByte(c):
+			j := i
+			for j < len(text) && isWordByte(text[j]) {
+				j++
+			}
+			out = append(out, sqlToken{text: lowerASCII(text[i:j]), word: true})
+			i = j
+		default:
+			op, width := text[i:i+1], 1
+			switch two := string([]byte{c, next}); two {
+			case "<>", "<=", ">=", "||", "<<", ">>":
+				op, width = two, 2
+			case "!=":
+				op, width = "<>", 2
+			case "==":
+				op, width = "=", 2
+			}
+			out = append(out, sqlToken{text: op, punct: true})
+			i += width
+		}
+	}
+	return out, nil
+}
+
+// quotedEnd returns the index just past the quoted run that starts at
+// text[start], where a doubled closer inside the run is an escaped closer
+// (except for [...], which has no escape).
+func quotedEnd(text string, start int, closer byte) (int, error) {
+	for i := start + 1; i < len(text); i++ {
+		if text[i] != closer {
+			continue
+		}
+		if closer != ']' && i+1 < len(text) && text[i+1] == closer {
+			i++
+			continue
+		}
+		return i + 1, nil
+	}
+	return 0, errors.New("unterminated quoted text in schema SQL")
+}
+
+// lowerASCII folds ASCII upper-case letters to lower case.
+func lowerASCII(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if 'A' <= c && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	return string(b)
+}
+
+func isWordByte(c byte) bool {
+	return c == '_' || c == '$' || c >= 0x80 ||
+		('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') || ('0' <= c && c <= '9')
+}
+
+// indexPredicate returns the tokens of the WHERE predicate of a CREATE INDEX
+// statement, without parentheses that enclose the whole predicate.
+func indexPredicate(ddl string) ([]sqlToken, error) {
+	toks, err := sqlTokens(ddl)
+	if err != nil {
+		return nil, err
+	}
+	depth := 0
+	for i, t := range toks {
+		switch {
+		case t.punct && t.text == "(":
+			depth++
+		case t.punct && t.text == ")":
+			depth--
+		case depth == 0 && t.word && t.text == "where":
+			return stripOuterParens(toks[i+1:]), nil
+		}
+	}
+	return nil, errors.New("index has no WHERE predicate")
+}
+
+// stripOuterParens removes parentheses that enclose all of toks.
+func stripOuterParens(toks []sqlToken) []sqlToken {
+	for len(toks) >= 2 && toks[0] == (sqlToken{text: "(", punct: true}) && toks[len(toks)-1] == (sqlToken{text: ")", punct: true}) {
+		depth := 0
+		enclosing := true
+		for i, t := range toks {
+			switch {
+			case t.punct && t.text == "(":
+				depth++
+			case t.punct && t.text == ")":
+				depth--
+			}
+			if depth == 0 && i < len(toks)-1 {
+				enclosing = false
+				break
+			}
+		}
+		if !enclosing {
+			return toks
+		}
+		toks = toks[1 : len(toks)-1]
+	}
+	return toks
+}
+
+func equalTokens(a, b []sqlToken) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].text != b[i].text || a[i].punct != b[i].punct {
+			return false
+		}
+	}
+	return true
+}
+
+func tokenTexts(toks []sqlToken) []string {
+	out := make([]string, len(toks))
+	for i, t := range toks {
+		out[i] = t.text
+	}
+	return out
 }
 
 // intentColumnNames are the intents columns in table order (intentColumns as a
@@ -229,11 +434,22 @@ var intentColumnNames = []string{
 	"blocker_policy_disable", "blocker_campaign_pause", "blocker_authorization", "blocker_materialization_prereq",
 }
 
+// intentColumnType is the type sqliteSchema declares for an intents column.
+// The declared type sets the column's affinity, so a different one (say
+// INTEGER for operation_id) would change how stored and indexed values compare.
+func intentColumnType(name string) string {
+	if name == "admission_epoch" {
+		return "integer"
+	}
+	return "text"
+}
+
 // verifyIntentColumns checks the intents table has exactly the intent columns
-// in order, all NOT NULL, with intent_id as the only primary key column.
+// in order, each with its declared type (ASCII case-insensitive) and NOT NULL,
+// with intent_id as the only primary key column.
 func verifyIntentColumns(ctx context.Context, conn *sql.Conn) error {
 	want := intentColumnNames
-	rows, err := conn.QueryContext(ctx, `SELECT name, "notnull", pk FROM pragma_table_info('intents') ORDER BY cid`)
+	rows, err := conn.QueryContext(ctx, `SELECT name, type, "notnull", pk FROM pragma_table_info('intents') ORDER BY cid`)
 	if err != nil {
 		return err
 	}
@@ -241,14 +457,17 @@ func verifyIntentColumns(ctx context.Context, conn *sql.Conn) error {
 	var got []string
 	for rows.Next() {
 		var (
-			name        string
+			name, typ   string
 			notNull, pk int
 		)
-		if err := rows.Scan(&name, &notNull, &pk); err != nil {
+		if err := rows.Scan(&name, &typ, &notNull, &pk); err != nil {
 			return err
 		}
 		if notNull != 1 || (pk != 0) != (name == "intent_id") {
 			return newError(ps.CodeIntegrity, "intents column %q has notnull=%d pk=%d", name, notNull, pk)
+		}
+		if lowerASCII(typ) != intentColumnType(name) {
+			return newError(ps.CodeIntegrity, "intents column %q is declared %q, want %q", name, typ, intentColumnType(name))
 		}
 		got = append(got, name)
 	}

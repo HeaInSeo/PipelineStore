@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
@@ -236,6 +237,20 @@ func dbSnapshot(t *testing.T, db *sql.DB) []string {
 	return snap
 }
 
+// rebuildIntents returns statements that recreate the intents table and its
+// indexes from schema, keeping the stored rows.
+func rebuildIntents(schema string) []string {
+	return []string{
+		"DROP INDEX intents_auto_key",
+		"DROP INDEX intents_operation_id",
+		"DROP INDEX intents_run_id",
+		"ALTER TABLE intents RENAME TO intents_old",
+		schema,
+		"INSERT INTO intents SELECT * FROM intents_old",
+		"DROP TABLE intents_old",
+	}
+}
+
 // A newer, unknown or missing version record, intent tables without a version
 // record, or a version record without its tables all fail the open with an
 // explicit code and leave the database exactly as it was: nothing is dropped,
@@ -278,6 +293,16 @@ func TestSQLiteStore_OpenRefusesUnsupportedSchema(t *testing.T) {
 			"CREATE VIEW intents AS SELECT * FROM intents_renamed",
 		}, ps.CodeIntegrity},
 		{"table-extra-column", []string{"ALTER TABLE intents ADD COLUMN extra TEXT NOT NULL DEFAULT ''"}, ps.CodeIntegrity},
+		{"index-wrong-predicate", []string{
+			"DROP INDEX intents_run_id",
+			"CREATE UNIQUE INDEX intents_run_id ON intents (run_id) WHERE run_id IS NOT NULL",
+		}, ps.CodeIntegrity},
+		{"index-predicate-wrong-literal", []string{
+			"DROP INDEX intents_operation_id",
+			"CREATE UNIQUE INDEX intents_operation_id ON intents (operation_id) WHERE origin = 'explicit'",
+		}, ps.CodeIntegrity},
+		{"column-wrong-type", rebuildIntents(strings.Replace(sqliteSchema,
+			"operation_id                   TEXT NOT NULL", "operation_id                   INTEGER NOT NULL", 1)), ps.CodeIntegrity},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -346,17 +371,25 @@ func TestSQLiteStore_ReopenCurrentVersionKeepsData(t *testing.T) {
 	}
 }
 
-// Schema verification reads SQLite metadata, not the stored SQL text: a
-// version-1 database whose objects are equivalent but written differently
-// still opens, unchanged.
+// Schema verification reads SQLite metadata, and compares only index
+// predicates token by token, never the whole stored SQL text: a version-1
+// database whose objects are equivalent but written differently (type case,
+// identifier quoting and case, operator spelling, parentheses, whitespace and
+// comments) still opens, unchanged.
 func TestSQLiteStore_OpenAcceptsEquivalentSchemaText(t *testing.T) {
 	ctx := context.Background()
 	db := openSQLite(t, sqlitePath(t))
 	in := mustCreateAutomatic(t, newSQLiteStore(t, db), "subject-1")
-	for _, stmt := range []string{
+	stmts := rebuildIntents(strings.NewReplacer("TEXT NOT NULL", "text not null", "INTEGER NOT NULL", "Integer NOT NULL").Replace(sqliteSchema))
+	stmts = append(stmts,
 		"DROP INDEX intents_run_id",
 		"create unique index intents_run_id on intents(run_id) where run_id!=''",
-	} {
+		"DROP INDEX intents_operation_id",
+		"CREATE UNIQUE INDEX \"intents_operation_id\" ON intents ([operation_id]) WHERE ( (\"ORIGIN\"=='EXPLICIT') ) -- explicit ledger",
+		"DROP INDEX intents_auto_key",
+		"CREATE UNIQUE INDEX intents_auto_key ON intents (auto_run_policy_id, input_binding_subject_identity) /* automatic */ WHERE `origin` = 'AUTOMATIC'",
+	)
+	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
 			t.Fatalf("%s: %v", stmt, err)
 		}
