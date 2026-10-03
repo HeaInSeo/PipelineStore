@@ -170,8 +170,9 @@ var intentIndexes = []struct {
 // expected one. Apart from the primary key and those indexes, intents has no
 // unique index or UNIQUE constraint and no partial or expression index (see
 // verifyPlainIndex), it has no hidden or generated column (see
-// verifyIntentColumns), no CHECK constraint (see verifyNoCheckConstraints) and
-// no trigger (see verifyNoTriggers). Other column collations are not read; the identity predicates
+// verifyIntentColumns), no CHECK constraint (see verifyNoCheckConstraints), no
+// trigger (see verifyNoTriggers) and no foreign key (see verifyNoForeignKeys).
+// Other column collations are not read; the identity predicates
 // pin BINARY instead (see whereID). SQLite exposes the
 // predicate only inside the stored CREATE INDEX text, so the predicate alone is
 // compared token by token (see indexPredicate); the rest of the text is not. A
@@ -198,6 +199,9 @@ func verifySchemaObjects(ctx context.Context, conn *sql.Conn) error {
 		return err
 	}
 	if err := verifyNoTriggers(ctx, conn); err != nil {
+		return err
+	}
+	if err := verifyNoForeignKeys(ctx, conn); err != nil {
 		return err
 	}
 	rows, err := conn.QueryContext(ctx, `SELECT name, "unique", partial, origin FROM pragma_index_list('intents')`)
@@ -374,6 +378,21 @@ func verifyNoTriggers(ctx context.Context, conn *sql.Conn) error {
 	}
 	if len(names) != 0 {
 		return newError(ps.CodeIntegrity, "intents has unexpected triggers %q", names)
+	}
+	return nil
+}
+
+// verifyNoForeignKeys checks that intents declares no foreign key. sqliteSchema
+// declares none, and with foreign_keys enabled on the connection a foreign key
+// refuses writes the store contract accepts with a raw constraint error.
+func verifyNoForeignKeys(ctx context.Context, conn *sql.Conn) error {
+	var n int
+	if err := conn.QueryRowContext(ctx,
+		`SELECT count(*) FROM pragma_foreign_key_list('intents')`).Scan(&n); err != nil {
+		return err
+	}
+	if n != 0 {
+		return newError(ps.CodeIntegrity, "intents has %d unexpected foreign key columns", n)
 	}
 	return nil
 }

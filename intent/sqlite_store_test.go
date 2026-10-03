@@ -322,6 +322,21 @@ func TestSQLiteStore_OpenRefusesUnsupportedSchema(t *testing.T) {
 		{"trigger-on-uppercase-table-name", []string{
 			`CREATE TRIGGER shouted BEFORE UPDATE ON "INTENTS" BEGIN SELECT RAISE(ABORT, 'narrowed'); END`,
 		}, ps.CodeIntegrity},
+		// With foreign_keys enabled, a foreign key would refuse a valid intent for
+		// subject-2 with a raw constraint error; the stored row's parent exists.
+		{"column-foreign-key", append(append([]string{
+			"CREATE TABLE intent_subjects (id TEXT NOT NULL PRIMARY KEY)",
+			"INSERT INTO intent_subjects VALUES ('subject-1')",
+		}, rebuildIntents(strings.Replace(sqliteSchema,
+			"input_binding_subject_identity TEXT NOT NULL", "input_binding_subject_identity TEXT NOT NULL REFERENCES intent_subjects (id)", 1))...),
+			"PRAGMA foreign_keys = ON"), ps.CodeIntegrity},
+		{"table-foreign-key", append(append([]string{
+			"CREATE TABLE intent_subjects (id TEXT NOT NULL PRIMARY KEY)",
+			"INSERT INTO intent_subjects VALUES ('subject-1')",
+		}, rebuildIntents(strings.Replace(sqliteSchema,
+			"blocker_materialization_prereq TEXT NOT NULL\n)",
+			"blocker_materialization_prereq TEXT NOT NULL,\n\tCONSTRAINT narrow Foreign Key (input_binding_subject_identity) REFERENCES intent_subjects (id)\n)", 1))...),
+			"PRAGMA foreign_keys = ON"), ps.CodeIntegrity},
 		// A generated column is hidden from pragma_table_info but computed on every
 		// write: NOT NULL here refuses a valid intent for subject-2, while the
 		// stored row computes 1.
