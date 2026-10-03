@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/google/uuid"
 
@@ -167,8 +168,10 @@ var intentIndexes = []struct {
 // unique partial index on intents over its key columns, each compared with
 // BINARY collation (see verifyBinaryKeys), whose WHERE predicate is the
 // expected one. Apart from the primary key and those indexes, intents has no
-// unique index or UNIQUE constraint, it has no CHECK constraint (see
-// verifyNoCheckConstraints) and no trigger (see verifyNoTriggers). Other column collations are not read; the identity predicates
+// unique index or UNIQUE constraint and no partial or expression index (see
+// verifyPlainIndex), it has no hidden or generated column (see
+// verifyIntentColumns), no CHECK constraint (see verifyNoCheckConstraints) and
+// no trigger (see verifyNoTriggers). Other column collations are not read; the identity predicates
 // pin BINARY instead (see whereID). SQLite exposes the
 // predicate only inside the stored CREATE INDEX text, so the predicate alone is
 // compared token by token (see indexPredicate); the rest of the text is not. A
@@ -211,9 +214,21 @@ func verifySchemaObjects(ctx context.Context, conn *sql.Conn) error {
 	for _, want := range intentIndexes {
 		allowedUnique[want.name] = true
 	}
-	for name, meta := range indexes {
-		if meta.unique && meta.origin != "pk" && !allowedUnique[name] {
+	names := make([]string, 0, len(indexes))
+	for name := range indexes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		meta := indexes[name]
+		if meta.origin == "pk" || allowedUnique[name] {
+			continue
+		}
+		if meta.unique {
 			return newError(ps.CodeIntegrity, "intents has unexpected unique index %q (origin %q)", name, meta.origin)
+		}
+		if err := verifyPlainIndex(ctx, conn, name, meta); err != nil {
+			return err
 		}
 	}
 	for _, want := range intentIndexes {
@@ -300,6 +315,28 @@ func readIndexList(rows indexRows) (map[string]indexMeta, error) {
 		return nil, err
 	}
 	return indexes, nil
+}
+
+// verifyPlainIndex checks that an extra non-unique index on intents is keyed
+// on plain columns and has no WHERE predicate. SQLite evaluates a partial
+// index's predicate and an expression key on every write, so either can fail
+// a write the store contract accepts with a raw error; an index over plain
+// columns only orders them and is left alone.
+func verifyPlainIndex(ctx context.Context, conn *sql.Conn, name string, meta indexMeta) error {
+	if meta.partial {
+		return newError(ps.CodeIntegrity, "intents has unexpected partial index %q", name)
+	}
+	// pragma_index_xinfo reports an expression key with cid -2 (and the rowid
+	// with cid -1); a plain column key has its column's cid.
+	var exprKeys int
+	if err := conn.QueryRowContext(ctx,
+		`SELECT count(*) FROM pragma_index_xinfo(?) WHERE key = 1 AND cid < 0`, name).Scan(&exprKeys); err != nil {
+		return err
+	}
+	if exprKeys != 0 {
+		return newError(ps.CodeIntegrity, "intents has unexpected expression index %q", name)
+	}
+	return nil
 }
 
 // verifyNoCheckConstraints checks that the stored CREATE TABLE text of intents
@@ -549,10 +586,14 @@ func intentColumnType(name string) string {
 
 // verifyIntentColumns checks the intents table has exactly the intent columns
 // in order, each with its declared type (ASCII case-insensitive) and NOT NULL,
-// with intent_id as the only primary key column.
+// with intent_id as the only primary key column. It reads pragma_table_xinfo,
+// which unlike pragma_table_info also lists hidden and generated columns: a
+// generated column is computed on every write and, NOT NULL or CHECKed, can
+// refuse a write the store contract accepts, so any column with hidden != 0
+// fails the check.
 func verifyIntentColumns(ctx context.Context, conn *sql.Conn) error {
 	want := intentColumnNames
-	rows, err := conn.QueryContext(ctx, `SELECT name, type, "notnull", pk FROM pragma_table_info('intents') ORDER BY cid`)
+	rows, err := conn.QueryContext(ctx, `SELECT name, type, "notnull", pk, hidden FROM pragma_table_xinfo('intents') ORDER BY cid`)
 	if err != nil {
 		return err
 	}
@@ -560,11 +601,14 @@ func verifyIntentColumns(ctx context.Context, conn *sql.Conn) error {
 	var got []string
 	for rows.Next() {
 		var (
-			name, typ   string
-			notNull, pk int
+			name, typ           string
+			notNull, pk, hidden int
 		)
-		if err := rows.Scan(&name, &typ, &notNull, &pk); err != nil {
+		if err := rows.Scan(&name, &typ, &notNull, &pk, &hidden); err != nil {
 			return err
+		}
+		if hidden != 0 {
+			return newError(ps.CodeIntegrity, "intents column %q is hidden or generated (hidden=%d)", name, hidden)
 		}
 		if notNull != 1 || (pk != 0) != (name == "intent_id") {
 			return newError(ps.CodeIntegrity, "intents column %q has notnull=%d pk=%d", name, notNull, pk)

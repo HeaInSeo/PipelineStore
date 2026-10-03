@@ -322,6 +322,28 @@ func TestSQLiteStore_OpenRefusesUnsupportedSchema(t *testing.T) {
 		{"trigger-on-uppercase-table-name", []string{
 			`CREATE TRIGGER shouted BEFORE UPDATE ON "INTENTS" BEGIN SELECT RAISE(ABORT, 'narrowed'); END`,
 		}, ps.CodeIntegrity},
+		// A generated column is hidden from pragma_table_info but computed on every
+		// write: NOT NULL here refuses a valid intent for subject-2, while the
+		// stored row computes 1.
+		{"generated-virtual-column", rebuildIntents(strings.Replace(sqliteSchema,
+			"blocker_materialization_prereq TEXT NOT NULL\n)",
+			"blocker_materialization_prereq TEXT NOT NULL,\n\tnarrowed INTEGER NOT NULL GENERATED ALWAYS AS (CASE WHEN input_binding_subject_identity = 'subject-2' THEN NULL ELSE 1 END) VIRTUAL\n)", 1)), ps.CodeIntegrity},
+		{"generated-stored-column", rebuildIntents(strings.Replace(sqliteSchema,
+			"blocker_materialization_prereq TEXT NOT NULL\n)",
+			"blocker_materialization_prereq TEXT NOT NULL,\n\tnarrowed INTEGER NOT NULL GENERATED ALWAYS AS (CASE WHEN input_binding_subject_identity = 'subject-2' THEN NULL ELSE 1 END) STORED\n)", 1)), ps.CodeIntegrity},
+		// An extra index's expression key or WHERE predicate is evaluated on every
+		// write: json() fails for subject-2 ('x' is not JSON), while the stored
+		// row evaluates json('0').
+		{"extra-expression-index", []string{
+			"CREATE INDEX intents_narrowed ON intents (json(CASE WHEN input_binding_subject_identity = 'subject-2' THEN 'x' ELSE '0' END))",
+		}, ps.CodeIntegrity},
+		{"extra-partial-index", []string{
+			"CREATE INDEX intents_narrowed ON intents (run_id) WHERE json(CASE WHEN input_binding_subject_identity = 'subject-2' THEN 'x' ELSE '0' END) IS NOT NULL",
+		}, ps.CodeIntegrity},
+		// The second key is the expression; the first is a plain column.
+		{"extra-mixed-expression-index", []string{
+			"CREATE INDEX intents_narrowed ON intents (run_id, json(CASE WHEN input_binding_subject_identity = 'subject-2' THEN 'x' ELSE '0' END))",
+		}, ps.CodeIntegrity},
 		{"index-wrong-predicate", []string{
 			"DROP INDEX intents_run_id",
 			"CREATE UNIQUE INDEX intents_run_id ON intents (run_id) WHERE run_id IS NOT NULL",
@@ -493,6 +515,29 @@ func TestSQLiteStore_OpenAcceptsCheckLiteral(t *testing.T) {
 	if after := dbSnapshot(t, db); !reflect.DeepEqual(after, before) {
 		t.Fatalf("open changed the database\nbefore=%q\nafter=%q", before, after)
 	}
+}
+
+// An extra non-unique index over plain columns cannot refuse a write, so the
+// open accepts it, changes nothing, and later writes still succeed.
+func TestSQLiteStore_OpenAcceptsPlainExtraIndex(t *testing.T) {
+	ctx := context.Background()
+	db := openSQLite(t, sqlitePath(t))
+	in := mustCreateAutomatic(t, newSQLiteStore(t, db), "subject-1")
+	if _, err := db.Exec("CREATE INDEX intents_by_pipeline ON intents (pipeline_id, run_id COLLATE NOCASE)"); err != nil {
+		t.Fatalf("create plain index: %v", err)
+	}
+	before := dbSnapshot(t, db)
+	s, err := NewSQLiteStore(ctx, db)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore with a plain extra index: %v", err)
+	}
+	if got := mustGetIntent(t, s, in.ID); got != in {
+		t.Fatalf("intent after open: %+v, want %+v", got, in)
+	}
+	if after := dbSnapshot(t, db); !reflect.DeepEqual(after, before) {
+		t.Fatalf("open changed the database\nbefore=%q\nafter=%q", before, after)
+	}
+	mustCreateAutomatic(t, s, "subject-2")
 }
 
 // failingIndexRows yields one well-formed index row and then stops with an
