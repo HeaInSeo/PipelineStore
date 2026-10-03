@@ -303,6 +303,13 @@ func TestSQLiteStore_OpenRefusesUnsupportedSchema(t *testing.T) {
 		{"extra-unique-index", []string{
 			"CREATE UNIQUE INDEX intents_subject ON intents (input_binding_subject_identity)",
 		}, ps.CodeIntegrity},
+		// A CHECK constraint would refuse a valid intent with a raw constraint
+		// error on a later write; the stored row still satisfies it.
+		{"column-check-constraint", rebuildIntents(strings.Replace(sqliteSchema,
+			"input_binding_subject_identity TEXT NOT NULL", "input_binding_subject_identity TEXT NOT NULL CHECK (input_binding_subject_identity <> 'subject-2')", 1)), ps.CodeIntegrity},
+		{"table-check-constraint", rebuildIntents(strings.Replace(sqliteSchema,
+			"blocker_materialization_prereq TEXT NOT NULL\n)",
+			"blocker_materialization_prereq TEXT NOT NULL,\n\tCONSTRAINT narrow Check(length(operation_id) < 4)\n)", 1)), ps.CodeIntegrity},
 		{"index-wrong-predicate", []string{
 			"DROP INDEX intents_run_id",
 			"CREATE UNIQUE INDEX intents_run_id ON intents (run_id) WHERE run_id IS NOT NULL",
@@ -448,6 +455,71 @@ func TestSQLiteStore_OpenAcceptsEquivalentSchemaText(t *testing.T) {
 	}
 	if after := dbSnapshot(t, db); !reflect.DeepEqual(after, before) {
 		t.Fatalf("open changed the database\nbefore=%q\nafter=%q", before, after)
+	}
+}
+
+// Only a CHECK keyword is a CHECK constraint: a column default whose string
+// literal spells "check" narrows nothing, so the open accepts it unchanged.
+func TestSQLiteStore_OpenAcceptsCheckLiteral(t *testing.T) {
+	ctx := context.Background()
+	db := openSQLite(t, sqlitePath(t))
+	in := mustCreateAutomatic(t, newSQLiteStore(t, db), "subject-1")
+	for _, stmt := range rebuildIntents(strings.Replace(sqliteSchema,
+		"blocker_authorization          TEXT NOT NULL", "blocker_authorization          TEXT NOT NULL DEFAULT 'check'", 1)) {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	before := dbSnapshot(t, db)
+	s, err := NewSQLiteStore(ctx, db)
+	if err != nil {
+		t.Fatalf("NewSQLiteStore with a 'check' literal: %v", err)
+	}
+	if got := mustGetIntent(t, s, in.ID); got != in {
+		t.Fatalf("intent after open: %+v, want %+v", got, in)
+	}
+	if after := dbSnapshot(t, db); !reflect.DeepEqual(after, before) {
+		t.Fatalf("open changed the database\nbefore=%q\nafter=%q", before, after)
+	}
+}
+
+// failingIndexRows yields one well-formed index row and then stops with an
+// iteration error, as *sql.Rows does when reading a later row fails.
+type failingIndexRows struct {
+	served bool
+	err    error
+}
+
+func (r *failingIndexRows) Next() bool {
+	if r.served {
+		return false
+	}
+	r.served = true
+	return true
+}
+
+func (r *failingIndexRows) Scan(dest ...any) error {
+	*dest[0].(*string) = "intents_auto_key"
+	*dest[1].(*int) = 1
+	*dest[2].(*int) = 1
+	*dest[3].(*string) = "c"
+	return nil
+}
+
+func (r *failingIndexRows) Err() error   { return r.err }
+func (r *failingIndexRows) Close() error { return nil }
+
+// An iteration error after some rows fails the index list read instead of
+// returning the rows read so far as the whole list.
+func TestReadIndexList_IterationErrorFailsClosed(t *testing.T) {
+	boom := errors.New("injected iteration error")
+	indexes, err := readIndexList(&failingIndexRows{err: boom})
+	if !errors.Is(err, boom) || indexes != nil {
+		t.Fatalf("readIndexList = %v, %v; want nil, %v", indexes, err, boom)
+	}
+	indexes, err = readIndexList(&failingIndexRows{})
+	if err != nil || len(indexes) != 1 || indexes["intents_auto_key"] != (indexMeta{unique: true, partial: true, origin: "c"}) {
+		t.Fatalf("readIndexList without error = %v, %v; want the one row", indexes, err)
 	}
 }
 

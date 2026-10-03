@@ -167,7 +167,8 @@ var intentIndexes = []struct {
 // unique partial index on intents over its key columns, each compared with
 // BINARY collation (see verifyBinaryKeys), whose WHERE predicate is the
 // expected one. Apart from the primary key and those indexes, intents has no
-// unique index or UNIQUE constraint. Other column collations are not read; the identity predicates
+// unique index or UNIQUE constraint, and it has no CHECK constraint (see
+// verifyNoCheckConstraints). Other column collations are not read; the identity predicates
 // pin BINARY instead (see whereID). SQLite exposes the
 // predicate only inside the stored CREATE INDEX text, so the predicate alone is
 // compared token by token (see indexPredicate); the rest of the text is not. A
@@ -190,27 +191,15 @@ func verifySchemaObjects(ctx context.Context, conn *sql.Conn) error {
 	if err := verifyIntentColumns(ctx, conn); err != nil {
 		return err
 	}
-	type indexMeta struct {
-		unique, partial bool
-		origin          string
+	if err := verifyNoCheckConstraints(ctx, conn); err != nil {
+		return err
 	}
-	indexes := map[string]indexMeta{}
 	rows, err := conn.QueryContext(ctx, `SELECT name, "unique", partial, origin FROM pragma_index_list('intents')`)
 	if err != nil {
 		return err
 	}
-	for rows.Next() {
-		var (
-			name, origin    string
-			unique, partial int
-		)
-		if err := rows.Scan(&name, &unique, &partial, &origin); err != nil {
-			_ = rows.Close()
-			return err
-		}
-		indexes[name] = indexMeta{unique: unique == 1, partial: partial == 1, origin: origin}
-	}
-	if err := rows.Close(); err != nil {
+	indexes, err := readIndexList(rows)
+	if err != nil {
 		return err
 	}
 	// Any other uniqueness on intents (a UNIQUE column or table constraint, or
@@ -269,6 +258,69 @@ func verifySchemaObjects(ctx context.Context, conn *sql.Conn) error {
 		return newError(ps.CodeIntegrity, "intents has %d primary key indexes, want 1", len(pks))
 	}
 	return verifyBinaryKeys(ctx, conn, pks[0])
+}
+
+// indexMeta is one row of pragma_index_list('intents').
+type indexMeta struct {
+	unique, partial bool
+	origin          string
+}
+
+// indexRows is the part of *sql.Rows that readIndexList uses.
+type indexRows interface {
+	Next() bool
+	Scan(dest ...any) error
+	Err() error
+	Close() error
+}
+
+// readIndexList reads (name, unique, partial, origin) rows into a map keyed by
+// index name and closes rows. An error that ends the iteration early fails the
+// read, so a partial list is never taken for the whole one.
+func readIndexList(rows indexRows) (map[string]indexMeta, error) {
+	defer func() { _ = rows.Close() }()
+	indexes := map[string]indexMeta{}
+	for rows.Next() {
+		var (
+			name, origin    string
+			unique, partial int
+		)
+		if err := rows.Scan(&name, &unique, &partial, &origin); err != nil {
+			return nil, err
+		}
+		indexes[name] = indexMeta{unique: unique == 1, partial: partial == 1, origin: origin}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	return indexes, nil
+}
+
+// verifyNoCheckConstraints checks that the stored CREATE TABLE text of intents
+// has no CHECK constraint, on a column or on the table. sqliteSchema declares
+// none, and SQLite exposes CHECK constraints only inside that text, so any
+// CHECK keyword token there (a quoted identifier or a string literal spelling
+// "check" is not one) would narrow the rows the store contract accepts and
+// fail a later write with a raw constraint error.
+func verifyNoCheckConstraints(ctx context.Context, conn *sql.Conn) error {
+	var ddl string
+	if err := conn.QueryRowContext(ctx,
+		`SELECT coalesce(sql, '') FROM sqlite_master WHERE type = 'table' AND name = 'intents'`).Scan(&ddl); err != nil {
+		return err
+	}
+	toks, err := sqlTokens(ddl)
+	if err != nil {
+		return newError(ps.CodeIntegrity, "intents table: %v", err)
+	}
+	for _, t := range toks {
+		if t.word && t.text == "check" {
+			return newError(ps.CodeIntegrity, "intents has an unexpected CHECK constraint")
+		}
+	}
+	return nil
 }
 
 // sqlToken is one token of SQL text. Keywords and identifiers (quoted or not)
