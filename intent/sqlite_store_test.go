@@ -293,6 +293,16 @@ func TestSQLiteStore_OpenRefusesUnsupportedSchema(t *testing.T) {
 			"CREATE VIEW intents AS SELECT * FROM intents_renamed",
 		}, ps.CodeIntegrity},
 		{"table-extra-column", []string{"ALTER TABLE intents ADD COLUMN extra TEXT NOT NULL DEFAULT ''"}, ps.CodeIntegrity},
+		// Extra uniqueness would refuse a second valid intent sharing the subject
+		// under another policy or operation.
+		{"table-unique-constraint", rebuildIntents(strings.Replace(sqliteSchema,
+			"blocker_materialization_prereq TEXT NOT NULL\n)",
+			"blocker_materialization_prereq TEXT NOT NULL,\n\tUNIQUE(input_binding_subject_identity)\n)", 1)), ps.CodeIntegrity},
+		{"column-unique-constraint", rebuildIntents(strings.Replace(sqliteSchema,
+			"input_binding_subject_identity TEXT NOT NULL", "input_binding_subject_identity TEXT NOT NULL UNIQUE", 1)), ps.CodeIntegrity},
+		{"extra-unique-index", []string{
+			"CREATE UNIQUE INDEX intents_subject ON intents (input_binding_subject_identity)",
+		}, ps.CodeIntegrity},
 		{"index-wrong-predicate", []string{
 			"DROP INDEX intents_run_id",
 			"CREATE UNIQUE INDEX intents_run_id ON intents (run_id) WHERE run_id IS NOT NULL",

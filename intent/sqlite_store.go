@@ -166,7 +166,8 @@ var intentIndexes = []struct {
 // key, its index keyed with BINARY collation), and each required index is a
 // unique partial index on intents over its key columns, each compared with
 // BINARY collation (see verifyBinaryKeys), whose WHERE predicate is the
-// expected one. Other column collations are not read; the identity predicates
+// expected one. Apart from the primary key and those indexes, intents has no
+// unique index or UNIQUE constraint. Other column collations are not read; the identity predicates
 // pin BINARY instead (see whereID). SQLite exposes the
 // predicate only inside the stored CREATE INDEX text, so the predicate alone is
 // compared token by token (see indexPredicate); the rest of the text is not. A
@@ -189,25 +190,39 @@ func verifySchemaObjects(ctx context.Context, conn *sql.Conn) error {
 	if err := verifyIntentColumns(ctx, conn); err != nil {
 		return err
 	}
-	type indexMeta struct{ unique, partial bool }
+	type indexMeta struct {
+		unique, partial bool
+		origin          string
+	}
 	indexes := map[string]indexMeta{}
-	rows, err := conn.QueryContext(ctx, `SELECT name, "unique", partial FROM pragma_index_list('intents')`)
+	rows, err := conn.QueryContext(ctx, `SELECT name, "unique", partial, origin FROM pragma_index_list('intents')`)
 	if err != nil {
 		return err
 	}
 	for rows.Next() {
 		var (
-			name            string
+			name, origin    string
 			unique, partial int
 		)
-		if err := rows.Scan(&name, &unique, &partial); err != nil {
+		if err := rows.Scan(&name, &unique, &partial, &origin); err != nil {
 			_ = rows.Close()
 			return err
 		}
-		indexes[name] = indexMeta{unique: unique == 1, partial: partial == 1}
+		indexes[name] = indexMeta{unique: unique == 1, partial: partial == 1, origin: origin}
 	}
 	if err := rows.Close(); err != nil {
 		return err
+	}
+	// Any other uniqueness on intents (a UNIQUE column or table constraint, or
+	// an extra unique index) would refuse writes the store contract accepts.
+	allowedUnique := map[string]bool{}
+	for _, want := range intentIndexes {
+		allowedUnique[want.name] = true
+	}
+	for name, meta := range indexes {
+		if meta.unique && meta.origin != "pk" && !allowedUnique[name] {
+			return newError(ps.CodeIntegrity, "intents has unexpected unique index %q (origin %q)", name, meta.origin)
+		}
 	}
 	for _, want := range intentIndexes {
 		if err := objectOn(want.name, "index"); err != nil {
