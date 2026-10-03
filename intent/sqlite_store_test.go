@@ -310,6 +310,18 @@ func TestSQLiteStore_OpenRefusesUnsupportedSchema(t *testing.T) {
 		{"table-check-constraint", rebuildIntents(strings.Replace(sqliteSchema,
 			"blocker_materialization_prereq TEXT NOT NULL\n)",
 			"blocker_materialization_prereq TEXT NOT NULL,\n\tCONSTRAINT narrow Check(length(operation_id) < 4)\n)", 1)), ps.CodeIntegrity},
+		// A trigger would refuse a valid intent with a raw error on a later write,
+		// or rewrite what is stored; the stored row passes through it untouched.
+		{"narrowing-trigger", []string{
+			"CREATE TRIGGER narrowed BEFORE INSERT ON intents WHEN NEW.input_binding_subject_identity = 'subject-2' BEGIN SELECT RAISE(ABORT, 'narrowed'); END",
+		}, ps.CodeIntegrity},
+		{"rewriting-trigger", []string{
+			"CREATE TRIGGER rewritten AFTER INSERT ON intents BEGIN UPDATE intents SET auto_run_policy_id = 'other' WHERE intent_id = NEW.intent_id; END",
+		}, ps.CodeIntegrity},
+		// Table names are case-insensitive: a trigger declared on "INTENTS" is on intents.
+		{"trigger-on-uppercase-table-name", []string{
+			`CREATE TRIGGER shouted BEFORE UPDATE ON "INTENTS" BEGIN SELECT RAISE(ABORT, 'narrowed'); END`,
+		}, ps.CodeIntegrity},
 		{"index-wrong-predicate", []string{
 			"DROP INDEX intents_run_id",
 			"CREATE UNIQUE INDEX intents_run_id ON intents (run_id) WHERE run_id IS NOT NULL",

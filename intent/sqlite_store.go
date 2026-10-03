@@ -167,8 +167,8 @@ var intentIndexes = []struct {
 // unique partial index on intents over its key columns, each compared with
 // BINARY collation (see verifyBinaryKeys), whose WHERE predicate is the
 // expected one. Apart from the primary key and those indexes, intents has no
-// unique index or UNIQUE constraint, and it has no CHECK constraint (see
-// verifyNoCheckConstraints). Other column collations are not read; the identity predicates
+// unique index or UNIQUE constraint, it has no CHECK constraint (see
+// verifyNoCheckConstraints) and no trigger (see verifyNoTriggers). Other column collations are not read; the identity predicates
 // pin BINARY instead (see whereID). SQLite exposes the
 // predicate only inside the stored CREATE INDEX text, so the predicate alone is
 // compared token by token (see indexPredicate); the rest of the text is not. A
@@ -192,6 +192,9 @@ func verifySchemaObjects(ctx context.Context, conn *sql.Conn) error {
 		return err
 	}
 	if err := verifyNoCheckConstraints(ctx, conn); err != nil {
+		return err
+	}
+	if err := verifyNoTriggers(ctx, conn); err != nil {
 		return err
 	}
 	rows, err := conn.QueryContext(ctx, `SELECT name, "unique", partial, origin FROM pragma_index_list('intents')`)
@@ -319,6 +322,21 @@ func verifyNoCheckConstraints(ctx context.Context, conn *sql.Conn) error {
 		if t.word && t.text == "check" {
 			return newError(ps.CodeIntegrity, "intents has an unexpected CHECK constraint")
 		}
+	}
+	return nil
+}
+
+// verifyNoTriggers checks that no trigger is defined on intents. sqliteSchema
+// creates none, and a trigger can refuse or rewrite writes the store contract
+// accepts, failing a later write with a raw error or changing what is stored.
+func verifyNoTriggers(ctx context.Context, conn *sql.Conn) error {
+	names, err := queryStrings(ctx, conn,
+		`SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'intents' COLLATE NOCASE ORDER BY name`)
+	if err != nil {
+		return err
+	}
+	if len(names) != 0 {
+		return newError(ps.CodeIntegrity, "intents has unexpected triggers %q", names)
 	}
 	return nil
 }
