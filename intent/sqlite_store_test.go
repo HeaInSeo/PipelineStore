@@ -343,6 +343,11 @@ func TestSQLiteStore_OpenRefusesUnsupportedSchema(t *testing.T) {
 			"CREATE TEMP TABLE intent_schema_version (singleton INTEGER NOT NULL PRIMARY KEY, version INTEGER NOT NULL)",
 			"INSERT INTO temp.intent_schema_version VALUES (1, 1)",
 		}, ps.CodeUnsupportedVersion},
+		// Canonical TEMP copies must not hide a bad main schema from the column check.
+		{"bad-main-schema-behind-temp-shadow", []string{
+			"ALTER TABLE intents ADD COLUMN extra TEXT NOT NULL DEFAULT ''",
+			tempShadowSchema,
+		}, ps.CodeIntegrity},
 		// With foreign_keys enabled, a foreign key would refuse a valid intent for
 		// subject-2 with a raw constraint error; the stored row's parent exists.
 		{"column-foreign-key", append(append([]string{
@@ -578,9 +583,9 @@ func TestSQLiteStore_OpenAcceptsPlainExtraIndex(t *testing.T) {
 
 // TEMP tables and indexes shaped exactly like the intent objects, on the one
 // connection the store uses, neither pass for nor capture the durable ones:
-// reads find the stored intent, writes land in main and survive a restart, and
-// the TEMP copies stay empty. This holds for a recorded database and for one
-// the open initializes.
+// reads find the stored intent, writes (create, RunID attachment, blocker
+// update) land in main and survive a restart, and the TEMP copies stay empty.
+// This holds for a recorded database and for one the open initializes.
 func TestSQLiteStore_TempShadowTablesDoNotCaptureWrites(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -613,6 +618,16 @@ func TestSQLiteStore_TempShadowTablesDoNotCaptureWrites(t *testing.T) {
 				}
 			}
 			created := mustCreateAutomatic(t, s, "subject-2")
+			if _, err := s.AttachRunID(ctx, created.ID, "run-1"); err != nil {
+				t.Fatalf("attach next to TEMP shadow: %v", err)
+			}
+			updated, err := s.UpdateBlocker(ctx, created.ID, BlockerMaterializationPrereq, BlockerBlocked)
+			if err != nil {
+				t.Fatalf("block next to TEMP shadow: %v", err)
+			}
+			if updated.RunID != "run-1" {
+				t.Fatalf("blocker update dropped the RunID: %+v", updated)
+			}
 			var shadowRows int
 			if err := db.QueryRow("SELECT count(*) FROM temp.intents").Scan(&shadowRows); err != nil || shadowRows != 0 {
 				t.Fatalf("TEMP intents rows = %d err=%v, want 0", shadowRows, err)
@@ -623,8 +638,8 @@ func TestSQLiteStore_TempShadowTablesDoNotCaptureWrites(t *testing.T) {
 			}
 
 			r := reopenSQLite(t, db, path)
-			if got := mustGetIntent(t, r, created.ID); got != created {
-				t.Fatalf("intent written next to TEMP shadow after reopen: %+v, want %+v", got, created)
+			if got := mustGetIntent(t, r, created.ID); got != updated {
+				t.Fatalf("intent written next to TEMP shadow after reopen: %+v, want %+v", got, updated)
 			}
 		})
 	}
