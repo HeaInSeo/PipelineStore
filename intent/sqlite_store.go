@@ -50,13 +50,13 @@ const sqliteBusyTimeout = 5000
 const intentSchemaVersion = 1
 
 const sqliteVersionTable = `
-CREATE TABLE intent_schema_version (
+CREATE TABLE main.intent_schema_version (
 	singleton INTEGER NOT NULL PRIMARY KEY CHECK (singleton = 1),
 	version   INTEGER NOT NULL
 )`
 
 const sqliteSchema = `
-CREATE TABLE intents (
+CREATE TABLE main.intents (
 	intent_id                      TEXT NOT NULL PRIMARY KEY,
 	origin                         TEXT NOT NULL,
 	auto_run_policy_id             TEXT NOT NULL,
@@ -72,10 +72,10 @@ CREATE TABLE intents (
 	blocker_authorization          TEXT NOT NULL,
 	blocker_materialization_prereq TEXT NOT NULL
 );
-CREATE UNIQUE INDEX intents_auto_key ON intents (auto_run_policy_id, input_binding_subject_identity)
+CREATE UNIQUE INDEX main.intents_auto_key ON intents (auto_run_policy_id, input_binding_subject_identity)
 	WHERE origin = 'AUTOMATIC';
-CREATE UNIQUE INDEX intents_operation_id ON intents (operation_id) WHERE origin = 'EXPLICIT';
-CREATE UNIQUE INDEX intents_run_id ON intents (run_id) WHERE run_id <> '';
+CREATE UNIQUE INDEX main.intents_operation_id ON intents (operation_id) WHERE origin = 'EXPLICIT';
+CREATE UNIQUE INDEX main.intents_run_id ON intents (run_id) WHERE run_id <> '';
 `
 
 // intentObjects are the schema objects sqliteSchema creates.
@@ -95,6 +95,10 @@ const intentColumns = `intent_id, origin, auto_run_policy_id, auto_run_policy_re
 // version record without its tables. Existing intent tables are never dropped,
 // recreated or migrated. Initialization runs in one transaction, so a failed
 // open leaves the database unchanged.
+//
+// Every statement names the main schema: a TEMP table or index named like an
+// intent object on a pooled connection would otherwise shadow it, passing the
+// checks and taking writes that vanish when that connection closes.
 func NewSQLiteStore(ctx context.Context, db *sql.DB) (*SQLiteStore, error) {
 	return newSQLiteStoreWithFault(ctx, db, nil)
 }
@@ -118,11 +122,11 @@ func newSQLiteStoreWithFault(ctx context.Context, db *sql.DB, fault func(step st
 func (s *SQLiteStore) initSchema(ctx context.Context, conn *sql.Conn) error {
 	var versioned, objects int
 	if err := conn.QueryRowContext(ctx,
-		`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'intent_schema_version'`).Scan(&versioned); err != nil {
+		`SELECT count(*) FROM main.sqlite_master WHERE type = 'table' AND name = 'intent_schema_version'`).Scan(&versioned); err != nil {
 		return err
 	}
 	if err := conn.QueryRowContext(ctx,
-		`SELECT count(*) FROM sqlite_master WHERE name IN (`+intentObjects+`)`).Scan(&objects); err != nil {
+		`SELECT count(*) FROM main.sqlite_master WHERE name IN (`+intentObjects+`)`).Scan(&objects); err != nil {
 		return err
 	}
 	if versioned == 0 {
@@ -132,7 +136,7 @@ func (s *SQLiteStore) initSchema(ctx context.Context, conn *sql.Conn) error {
 		return s.createSchema(ctx, conn)
 	}
 	var version int64
-	err := conn.QueryRowContext(ctx, `SELECT version FROM intent_schema_version WHERE singleton = 1`).Scan(&version)
+	err := conn.QueryRowContext(ctx, `SELECT version FROM main.intent_schema_version WHERE singleton = 1`).Scan(&version)
 	if errors.Is(err, sql.ErrNoRows) {
 		return newError(ps.CodeIntegrity, "intent schema version table has no version record")
 	}
@@ -181,7 +185,7 @@ func verifySchemaObjects(ctx context.Context, conn *sql.Conn) error {
 	objectOn := func(name, wantType string) error {
 		var typ, tbl string
 		if err := conn.QueryRowContext(ctx,
-			`SELECT type, tbl_name FROM sqlite_master WHERE name = ?`, name).Scan(&typ, &tbl); err != nil {
+			`SELECT type, tbl_name FROM main.sqlite_master WHERE name = ?`, name).Scan(&typ, &tbl); err != nil {
 			return err
 		}
 		if typ != wantType || tbl != "intents" {
@@ -204,7 +208,7 @@ func verifySchemaObjects(ctx context.Context, conn *sql.Conn) error {
 	if err := verifyNoForeignKeys(ctx, conn); err != nil {
 		return err
 	}
-	rows, err := conn.QueryContext(ctx, `SELECT name, "unique", partial, origin FROM pragma_index_list('intents')`)
+	rows, err := conn.QueryContext(ctx, `SELECT name, "unique", partial, origin FROM pragma_index_list('intents', 'main')`)
 	if err != nil {
 		return err
 	}
@@ -244,7 +248,7 @@ func verifySchemaObjects(ctx context.Context, conn *sql.Conn) error {
 			return newError(ps.CodeIntegrity, "intent index %q is unique=%v partial=%v, want a unique partial index", want.name, meta.unique, meta.partial)
 		}
 		// An expression key has no column name; it reads as "" and never matches.
-		cols, err := queryStrings(ctx, conn, `SELECT coalesce(name, '') FROM pragma_index_info(?) ORDER BY seqno`, want.name)
+		cols, err := queryStrings(ctx, conn, `SELECT coalesce(name, '') FROM pragma_index_info(?, 'main') ORDER BY seqno`, want.name)
 		if err != nil {
 			return err
 		}
@@ -256,7 +260,7 @@ func verifySchemaObjects(ctx context.Context, conn *sql.Conn) error {
 		}
 		var ddl string
 		if err := conn.QueryRowContext(ctx,
-			`SELECT coalesce(sql, '') FROM sqlite_master WHERE name = ?`, want.name).Scan(&ddl); err != nil {
+			`SELECT coalesce(sql, '') FROM main.sqlite_master WHERE name = ?`, want.name).Scan(&ddl); err != nil {
 			return err
 		}
 		got, err := indexPredicate(ddl)
@@ -272,7 +276,7 @@ func verifySchemaObjects(ctx context.Context, conn *sql.Conn) error {
 		}
 	}
 	// The primary key's index inherits intent_id's declared collation.
-	pks, err := queryStrings(ctx, conn, `SELECT name FROM pragma_index_list('intents') WHERE origin = 'pk'`)
+	pks, err := queryStrings(ctx, conn, `SELECT name FROM pragma_index_list('intents', 'main') WHERE origin = 'pk'`)
 	if err != nil {
 		return err
 	}
@@ -334,7 +338,7 @@ func verifyPlainIndex(ctx context.Context, conn *sql.Conn, name string, meta ind
 	// with cid -1); a plain column key has its column's cid.
 	var exprKeys int
 	if err := conn.QueryRowContext(ctx,
-		`SELECT count(*) FROM pragma_index_xinfo(?) WHERE key = 1 AND cid < 0`, name).Scan(&exprKeys); err != nil {
+		`SELECT count(*) FROM pragma_index_xinfo(?, 'main') WHERE key = 1 AND cid < 0`, name).Scan(&exprKeys); err != nil {
 		return err
 	}
 	if exprKeys != 0 {
@@ -352,7 +356,7 @@ func verifyPlainIndex(ctx context.Context, conn *sql.Conn, name string, meta ind
 func verifyNoCheckConstraints(ctx context.Context, conn *sql.Conn) error {
 	var ddl string
 	if err := conn.QueryRowContext(ctx,
-		`SELECT coalesce(sql, '') FROM sqlite_master WHERE type = 'table' AND name = 'intents'`).Scan(&ddl); err != nil {
+		`SELECT coalesce(sql, '') FROM main.sqlite_master WHERE type = 'table' AND name = 'intents'`).Scan(&ddl); err != nil {
 		return err
 	}
 	toks, err := sqlTokens(ddl)
@@ -370,9 +374,16 @@ func verifyNoCheckConstraints(ctx context.Context, conn *sql.Conn) error {
 // verifyNoTriggers checks that no trigger is defined on intents. sqliteSchema
 // creates none, and a trigger can refuse or rewrite writes the store contract
 // accepts, failing a later write with a raw error or changing what is stored.
+// A TEMP trigger lives in sqlite_temp_master, not in the main schema, yet still
+// fires on main.intents for every write on its connection, so both are read.
+// A TEMP trigger on a TEMP table named intents is refused too: its target is
+// not recorded there, and refusing it is the fail-closed reading.
 func verifyNoTriggers(ctx context.Context, conn *sql.Conn) error {
 	names, err := queryStrings(ctx, conn,
-		`SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'intents' COLLATE NOCASE ORDER BY name`)
+		`SELECT name FROM main.sqlite_master WHERE type = 'trigger' AND tbl_name = 'intents' COLLATE NOCASE
+		UNION ALL
+		SELECT 'temp.' || name FROM temp.sqlite_master WHERE type = 'trigger' AND tbl_name = 'intents' COLLATE NOCASE
+		ORDER BY 1`)
 	if err != nil {
 		return err
 	}
@@ -388,7 +399,7 @@ func verifyNoTriggers(ctx context.Context, conn *sql.Conn) error {
 func verifyNoForeignKeys(ctx context.Context, conn *sql.Conn) error {
 	var n int
 	if err := conn.QueryRowContext(ctx,
-		`SELECT count(*) FROM pragma_foreign_key_list('intents')`).Scan(&n); err != nil {
+		`SELECT count(*) FROM pragma_foreign_key_list('intents', 'main')`).Scan(&n); err != nil {
 		return err
 	}
 	if n != 0 {
@@ -612,7 +623,7 @@ func intentColumnType(name string) string {
 // fails the check.
 func verifyIntentColumns(ctx context.Context, conn *sql.Conn) error {
 	want := intentColumnNames
-	rows, err := conn.QueryContext(ctx, `SELECT name, type, "notnull", pk, hidden FROM pragma_table_xinfo('intents') ORDER BY cid`)
+	rows, err := conn.QueryContext(ctx, `SELECT name, type, "notnull", pk, hidden FROM pragma_table_xinfo('intents', 'main') ORDER BY cid`)
 	if err != nil {
 		return err
 	}
@@ -652,7 +663,7 @@ func verifyIntentColumns(ctx context.Context, conn *sql.Conn) error {
 // would make the unique index treat distinct IDs such as "op" and "OP" as one.
 func verifyBinaryKeys(ctx context.Context, conn *sql.Conn, index string) error {
 	colls, err := queryStrings(ctx, conn,
-		`SELECT coalesce(coll, '') FROM pragma_index_xinfo(?) WHERE key = 1 ORDER BY seqno`, index)
+		`SELECT coalesce(coll, '') FROM pragma_index_xinfo(?, 'main') WHERE key = 1 ORDER BY seqno`, index)
 	if err != nil {
 		return err
 	}
@@ -706,7 +717,7 @@ func (s *SQLiteStore) createSchema(ctx context.Context, conn *sql.Conn) error {
 	if err := s.inject("schema-tables"); err != nil {
 		return err
 	}
-	if _, err := conn.ExecContext(ctx, `INSERT INTO intent_schema_version (singleton, version) VALUES (1, ?)`, intentSchemaVersion); err != nil {
+	if _, err := conn.ExecContext(ctx, `INSERT INTO main.intent_schema_version (singleton, version) VALUES (1, ?)`, intentSchemaVersion); err != nil {
 		return err
 	}
 	return s.inject("schema-version-record")
@@ -781,7 +792,7 @@ func queryIntent(ctx context.Context, conn *sql.Conn, where string, args ...any)
 		in    Intent
 		epoch int64
 	)
-	err := conn.QueryRowContext(ctx, "SELECT "+intentColumns+" FROM intents WHERE "+where, args...).Scan(
+	err := conn.QueryRowContext(ctx, "SELECT "+intentColumns+" FROM main.intents WHERE "+where, args...).Scan(
 		&in.ID, &in.Origin, &in.AutoRunPolicyID, &in.AutoRunPolicyRevision, &in.OperationID,
 		&in.InputBindingSubjectIdentity, &in.PipelineRevision.PipelineID, &in.PipelineRevision.RevisionID, &in.RunID, &epoch,
 		&in.Blockers.PolicyDisable, &in.Blockers.CampaignPause, &in.Blockers.Authorization, &in.Blockers.MaterializationPrereq,
@@ -803,7 +814,7 @@ func insertIntent(ctx context.Context, conn *sql.Conn, in Intent) error {
 	if in.AdmissionEpoch > 1<<63-1 {
 		return newError(ps.CodeInvalidContract, "admission epoch %d does not fit the store", in.AdmissionEpoch)
 	}
-	_, err := conn.ExecContext(ctx, "INSERT INTO intents ("+intentColumns+") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+	_, err := conn.ExecContext(ctx, "INSERT INTO main.intents ("+intentColumns+") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 		string(in.ID), string(in.Origin), in.AutoRunPolicyID, in.AutoRunPolicyRevision, in.OperationID,
 		in.InputBindingSubjectIdentity, in.PipelineRevision.PipelineID, string(in.PipelineRevision.RevisionID), string(in.RunID),
 		int64(in.AdmissionEpoch),
@@ -934,7 +945,7 @@ func (s *SQLiteStore) AttachRunID(ctx context.Context, id ID, run RunID) (out In
 		if err := s.inject(stepRunIndexStaged); err != nil {
 			return err
 		}
-		if _, err := conn.ExecContext(ctx, "UPDATE intents SET run_id = ? WHERE "+whereID, string(run), string(id)); err != nil {
+		if _, err := conn.ExecContext(ctx, "UPDATE main.intents SET run_id = ? WHERE "+whereID, string(run), string(id)); err != nil {
 			return fmt.Errorf("intent: attach RunID: %w", err)
 		}
 		if err := s.inject(stepIntentStaged); err != nil {
@@ -999,7 +1010,7 @@ func (s *SQLiteStore) UpdateBlocker(ctx context.Context, id ID, owner BlockerOwn
 		if err := s.inject(stepBlockerStaged); err != nil {
 			return err
 		}
-		if _, err := conn.ExecContext(ctx, "UPDATE intents SET "+column+" = ? WHERE "+whereID, string(state), string(id)); err != nil {
+		if _, err := conn.ExecContext(ctx, "UPDATE main.intents SET "+column+" = ? WHERE "+whereID, string(state), string(id)); err != nil {
 			return fmt.Errorf("intent: update blocker: %w", err)
 		}
 		*slot = state

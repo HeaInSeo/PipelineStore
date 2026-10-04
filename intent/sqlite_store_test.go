@@ -201,23 +201,25 @@ func TestSQLiteStore_PolicyLogFailsClosed(t *testing.T) {
 	}
 }
 
-// dbSnapshot lists every schema object of db with its SQL and, for tables, its
-// row count, so a refused open can be checked for zero mutation.
+// dbSnapshot lists every schema object of db, in the main and the TEMP schema,
+// with its SQL and, for tables, its row count, so a refused open can be checked
+// for zero mutation.
 func dbSnapshot(t *testing.T, db *sql.DB) []string {
 	t.Helper()
-	rows, err := db.Query(`SELECT type, name, coalesce(sql, '') FROM sqlite_master ORDER BY type, name`)
+	rows, err := db.Query(`SELECT 'main', type, name, coalesce(sql, '') FROM main.sqlite_master
+		UNION ALL SELECT 'temp', type, name, coalesce(sql, '') FROM temp.sqlite_master ORDER BY 1, 2, 3`)
 	if err != nil {
 		t.Fatalf("read schema: %v", err)
 	}
 	var snap, tables []string
 	for rows.Next() {
-		var typ, name, ddl string
-		if err := rows.Scan(&typ, &name, &ddl); err != nil {
+		var schema, typ, name, ddl string
+		if err := rows.Scan(&schema, &typ, &name, &ddl); err != nil {
 			t.Fatalf("scan schema: %v", err)
 		}
-		snap = append(snap, typ+" "+name+" "+ddl)
+		snap = append(snap, schema+" "+typ+" "+name+" "+ddl)
 		if typ == "table" {
-			tables = append(tables, name)
+			tables = append(tables, schema+`."`+name+`"`)
 		}
 	}
 	if err := rows.Close(); err != nil {
@@ -225,17 +227,22 @@ func dbSnapshot(t *testing.T, db *sql.DB) []string {
 	}
 	for _, name := range tables {
 		var n int
-		if err := db.QueryRow(`SELECT count(*) FROM "` + name + `"`).Scan(&n); err != nil {
+		if err := db.QueryRow(`SELECT count(*) FROM ` + name).Scan(&n); err != nil {
 			t.Fatalf("count %s: %v", name, err)
 		}
 		snap = append(snap, fmt.Sprintf("rows %s=%d", name, n))
 	}
 	var version sql.NullInt64
-	if err := db.QueryRow(`SELECT version FROM intent_schema_version`).Scan(&version); err == nil {
+	if err := db.QueryRow(`SELECT version FROM main.intent_schema_version`).Scan(&version); err == nil {
 		snap = append(snap, fmt.Sprintf("intent_schema_version=%d", version.Int64))
 	}
 	return snap
 }
+
+// tempShadowSchema creates TEMP copies of the intent tables and indexes, exactly
+// as sqliteSchema shapes them, so unqualified names on that connection resolve
+// to the copies.
+var tempShadowSchema = strings.ReplaceAll(sqliteSchema, "main.", "temp.")
 
 // rebuildIntents returns statements that recreate the intents table and its
 // indexes from schema, keeping the stored rows.
@@ -322,6 +329,20 @@ func TestSQLiteStore_OpenRefusesUnsupportedSchema(t *testing.T) {
 		{"trigger-on-uppercase-table-name", []string{
 			`CREATE TRIGGER shouted BEFORE UPDATE ON "INTENTS" BEGIN SELECT RAISE(ABORT, 'narrowed'); END`,
 		}, ps.CodeIntegrity},
+		// A TEMP trigger is stored in sqlite_temp_master but fires on main.intents
+		// for every write on its connection.
+		{"temp-narrowing-trigger", []string{
+			"CREATE TEMP TRIGGER narrowed BEFORE INSERT ON main.intents WHEN NEW.input_binding_subject_identity = 'subject-2' BEGIN SELECT RAISE(ABORT, 'narrowed'); END",
+		}, ps.CodeIntegrity},
+		{"temp-rewriting-trigger", []string{
+			"CREATE TEMP TRIGGER rewritten AFTER UPDATE ON main.intents BEGIN UPDATE main.intents SET auto_run_policy_id = 'other' WHERE intent_id = NEW.intent_id; END",
+		}, ps.CodeIntegrity},
+		// A TEMP version table must not hide the recorded version.
+		{"newer-version-behind-temp-version", []string{
+			"UPDATE intent_schema_version SET version = 2",
+			"CREATE TEMP TABLE intent_schema_version (singleton INTEGER NOT NULL PRIMARY KEY, version INTEGER NOT NULL)",
+			"INSERT INTO temp.intent_schema_version VALUES (1, 1)",
+		}, ps.CodeUnsupportedVersion},
 		// With foreign_keys enabled, a foreign key would refuse a valid intent for
 		// subject-2 with a raw constraint error; the stored row's parent exists.
 		{"column-foreign-key", append(append([]string{
@@ -553,6 +574,60 @@ func TestSQLiteStore_OpenAcceptsPlainExtraIndex(t *testing.T) {
 		t.Fatalf("open changed the database\nbefore=%q\nafter=%q", before, after)
 	}
 	mustCreateAutomatic(t, s, "subject-2")
+}
+
+// TEMP tables and indexes shaped exactly like the intent objects, on the one
+// connection the store uses, neither pass for nor capture the durable ones:
+// reads find the stored intent, writes land in main and survive a restart, and
+// the TEMP copies stay empty. This holds for a recorded database and for one
+// the open initializes.
+func TestSQLiteStore_TempShadowTablesDoNotCaptureWrites(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		recorded bool
+	}{{"recorded", true}, {"initialized", false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			path := sqlitePath(t)
+			db := openSQLite(t, path)
+			var stored Intent
+			if tc.recorded {
+				stored = mustCreateAutomatic(t, newSQLiteStore(t, db), "subject-1")
+			}
+			for _, stmt := range []string{
+				tempShadowSchema,
+				"CREATE TEMP TABLE intent_schema_version (singleton INTEGER NOT NULL PRIMARY KEY, version INTEGER NOT NULL)",
+				"INSERT INTO temp.intent_schema_version VALUES (1, 1)",
+			} {
+				if _, err := db.Exec(stmt); err != nil {
+					t.Fatalf("%s: %v", stmt, err)
+				}
+			}
+			s, err := NewSQLiteStore(ctx, db)
+			if err != nil {
+				t.Fatalf("NewSQLiteStore next to TEMP shadows: %v", err)
+			}
+			if tc.recorded {
+				if got, found, err := s.LookupAutomatic(ctx, stored.AutoRunPolicyID, "subject-1"); err != nil || !found || got != stored {
+					t.Fatalf("stored intent behind TEMP shadow: %+v found=%v err=%v, want %+v", got, found, err, stored)
+				}
+			}
+			created := mustCreateAutomatic(t, s, "subject-2")
+			var shadowRows int
+			if err := db.QueryRow("SELECT count(*) FROM temp.intents").Scan(&shadowRows); err != nil || shadowRows != 0 {
+				t.Fatalf("TEMP intents rows = %d err=%v, want 0", shadowRows, err)
+			}
+			var mainIndexes int
+			if err := db.QueryRow(`SELECT count(*) FROM main.sqlite_master WHERE type = 'index' AND tbl_name = 'intents' AND name IN (` + intentObjects + `)`).Scan(&mainIndexes); err != nil || mainIndexes != 3 {
+				t.Fatalf("intent indexes in main = %d err=%v, want 3", mainIndexes, err)
+			}
+
+			r := reopenSQLite(t, db, path)
+			if got := mustGetIntent(t, r, created.ID); got != created {
+				t.Fatalf("intent written next to TEMP shadow after reopen: %+v, want %+v", got, created)
+			}
+		})
+	}
 }
 
 // failingIndexRows yields one well-formed index row and then stops with an
