@@ -640,7 +640,9 @@ func (mismatchedReader) GetRevision(_ context.Context, pipelineID string, _ ps.P
 
 func TestNoExternalServiceImports(t *testing.T) {
 	allowed := map[string]bool{}
-	for _, p := range []string{"context", "errors", "fmt", "sort", "sync", "github.com/google/uuid", "github.com/HeaInSeo/PipelineStore"} {
+	// database/sql is the driver-neutral standard-library storage seam used by
+	// SQLiteStore; no SQL driver, network or service package is allowed.
+	for _, p := range []string{"context", "database/sql", "errors", "fmt", "sort", "sync", "github.com/google/uuid", "github.com/HeaInSeo/PipelineStore"} {
 		allowed[p] = true
 	}
 	files, err := filepath.Glob("*.go")
