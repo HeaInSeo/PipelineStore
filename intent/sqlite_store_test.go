@@ -953,7 +953,9 @@ func openSQLiteWithAllEq(t *testing.T) *sql.DB {
 // intents_auto_key, and a non-empty run_id holds for no row, so intents_run_id
 // indexes nothing and no longer enforces unique run IDs. The open refuses
 // either schema and changes nothing, even when the index keys themselves are
-// BINARY. Declared BINARY explicitly, both open.
+// BINARY. SQLite applies the last COLLATE clause of a column, so BINARY
+// followed by ALLEQ is ALLEQ and is refused too. Declared BINARY explicitly,
+// both open.
 func TestSQLiteStore_PredicateColumnsMustBeBinary(t *testing.T) {
 	const (
 		originCol = "origin                         TEXT NOT NULL"
@@ -966,6 +968,7 @@ func TestSQLiteStore_PredicateColumnsMustBeBinary(t *testing.T) {
 	}{
 		{"origin-alleq", strings.NewReplacer(originCol, "origin TEXT COLLATE ALLEQ NOT NULL"), false},
 		{"origin-alleq-quoted", strings.NewReplacer(originCol, `origin TEXT NOT NULL COLLATE "alleq"`), false},
+		{"origin-binary-then-alleq", strings.NewReplacer(originCol, "origin TEXT COLLATE BINARY COLLATE ALLEQ NOT NULL"), false},
 		{"run-id-alleq-binary-key", strings.NewReplacer(
 			runIDCol, "run_id TEXT COLLATE ALLEQ NOT NULL",
 			"(run_id)", "(run_id COLLATE BINARY)"), false},
