@@ -176,8 +176,9 @@ var intentIndexes = []struct {
 // verifyPlainIndex), it has no hidden or generated column (see
 // verifyIntentColumns), no CHECK constraint (see verifyNoCheckConstraints), no
 // trigger (see verifyNoTriggers) and no foreign key (see verifyNoForeignKeys).
-// Other column collations are not read; the identity predicates
-// pin BINARY instead (see whereID). SQLite exposes the
+// The columns the index predicates compare declare no collation but BINARY
+// (see verifyPredicateCollations). Other column collations are not read; the
+// identity predicates pin BINARY instead (see whereID). SQLite exposes the
 // predicate only inside the stored CREATE INDEX text, so the predicate alone is
 // compared token by token (see indexPredicate); the rest of the text is not. A
 // mismatch fails with ps.CodeIntegrity; nothing is repaired.
@@ -206,6 +207,9 @@ func verifySchemaObjects(ctx context.Context, conn *sql.Conn) error {
 		return err
 	}
 	if err := verifyNoForeignKeys(ctx, conn); err != nil {
+		return err
+	}
+	if err := verifyPredicateCollations(ctx, conn); err != nil {
 		return err
 	}
 	rows, err := conn.QueryContext(ctx, `SELECT name, "unique", partial, origin FROM pragma_index_list('intents', 'main')`)
@@ -406,6 +410,88 @@ func verifyNoForeignKeys(ctx context.Context, conn *sql.Conn) error {
 		return newError(ps.CodeIntegrity, "intents has %d unexpected foreign key columns", n)
 	}
 	return nil
+}
+
+// predicateColumns are the intents columns the WHERE predicates of
+// intentIndexes compare.
+var predicateColumns = []string{"origin", "run_id"}
+
+// verifyPredicateCollations checks that each of predicateColumns declares no
+// collation other than BINARY. A predicate operand compares with its column's
+// declared collation, so a collation under which every origin equals
+// 'AUTOMATIC' would put explicit intents in intents_auto_key and refuse a
+// second valid one, and one under which every run_id equals the empty string
+// would leave intents_run_id empty and run IDs no longer unique in the index.
+// SQLite exposes a column's declared collation only inside the stored CREATE
+// TABLE text, so the column definitions are read there: any COLLATE clause in
+// them that names another collation fails the check; a column without one is
+// BINARY.
+func verifyPredicateCollations(ctx context.Context, conn *sql.Conn) error {
+	var ddl string
+	if err := conn.QueryRowContext(ctx,
+		`SELECT coalesce(sql, '') FROM main.sqlite_master WHERE type = 'table' AND name = 'intents'`).Scan(&ddl); err != nil {
+		return err
+	}
+	toks, err := sqlTokens(ddl)
+	if err != nil {
+		return newError(ps.CodeIntegrity, "intents table: %v", err)
+	}
+	defs := columnDefinitions(toks)
+	for _, col := range predicateColumns {
+		def, ok := defs[col]
+		if !ok {
+			return newError(ps.CodeIntegrity, "intents table text has no definition of column %q", col)
+		}
+		for i, t := range def {
+			if !t.word || t.text != "collate" {
+				continue
+			}
+			if i+1 == len(def) || def[i+1].literal || def[i+1].punct || def[i+1].text != "binary" {
+				return newError(ps.CodeIntegrity, "intents column %q declares a collation other than BINARY", col)
+			}
+		}
+	}
+	return nil
+}
+
+// columnDefinitions splits the tokens of a CREATE TABLE statement into the
+// elements of its parenthesized definition list and returns them keyed by
+// their first token (a column's name), without that token. Table constraints
+// are keyed by their leading keyword and are not column names.
+func columnDefinitions(toks []sqlToken) map[string][]sqlToken {
+	defs := map[string][]sqlToken{}
+	depth := 0
+	var elem []sqlToken
+	add := func() {
+		if len(elem) > 0 {
+			if _, dup := defs[elem[0].text]; !dup {
+				defs[elem[0].text] = elem[1:]
+			}
+		}
+		elem = nil
+	}
+	for _, t := range toks {
+		switch {
+		case t.punct && t.text == "(":
+			depth++
+			if depth == 1 {
+				continue
+			}
+		case t.punct && t.text == ")":
+			depth--
+			if depth == 0 {
+				add()
+				return defs
+			}
+		case depth == 1 && t.punct && t.text == ",":
+			add()
+			continue
+		}
+		if depth >= 1 {
+			elem = append(elem, t)
+		}
+	}
+	return defs
 }
 
 // sqlToken is one token of SQL text. Keywords and identifiers (quoted or not)

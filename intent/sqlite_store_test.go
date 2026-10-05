@@ -11,7 +11,7 @@ import (
 	"sync"
 	"testing"
 
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
 
 	ps "github.com/HeaInSeo/PipelineStore"
 )
@@ -804,8 +804,10 @@ func TestSQLiteStore_OperationIDIndexMustBeBinary(t *testing.T) {
 
 // Identity columns declared NOCASE, with every required index explicitly
 // BINARY, pass schema verification. The identity predicates pin BINARY, so
-// "op"/"OP", "subject-1"/"SUBJECT-1" and "run"/"RUN" stay distinct identities
-// instead of replaying or conflicting with the stored one.
+// "op"/"OP" and "subject-1"/"SUBJECT-1" stay distinct identities instead of
+// replaying or conflicting with the stored one. run_id is compared by an index
+// predicate, so it must stay BINARY (see
+// TestSQLiteStore_PredicateColumnsMustBeBinary).
 func TestSQLiteStore_NocaseIdentityColumnsDoNotCollapse(t *testing.T) {
 	ctx := context.Background()
 	db := openSQLite(t, sqlitePath(t))
@@ -822,7 +824,6 @@ func TestSQLiteStore_NocaseIdentityColumnsDoNotCollapse(t *testing.T) {
 		"operation_id                   TEXT NOT NULL", "operation_id                   TEXT COLLATE NOCASE NOT NULL",
 		"auto_run_policy_id             TEXT NOT NULL", "auto_run_policy_id             TEXT COLLATE NOCASE NOT NULL",
 		"input_binding_subject_identity TEXT NOT NULL", "input_binding_subject_identity TEXT COLLATE NOCASE NOT NULL",
-		"run_id                         TEXT NOT NULL", "run_id                         TEXT COLLATE NOCASE NOT NULL",
 		"(auto_run_policy_id, input_binding_subject_identity)", "(auto_run_policy_id COLLATE BINARY, input_binding_subject_identity COLLATE BINARY)",
 		"(operation_id)", "(operation_id COLLATE BINARY)",
 		"(run_id)", "(run_id COLLATE BINARY)",
@@ -931,6 +932,98 @@ func TestSQLiteStore_NocaseIntentIDColumnWithBinaryPrimaryKey(t *testing.T) {
 	}
 	if after := dbSnapshot(t, db); !reflect.DeepEqual(after, before) {
 		t.Fatalf("case-variant calls changed the database\nbefore=%q\nafter=%q", before, after)
+	}
+}
+
+var registerAllEq sync.Once
+
+// openSQLiteWithAllEq opens a database whose connections know ALLEQ, a
+// collation under which all strings are equal.
+func openSQLiteWithAllEq(t *testing.T) *sql.DB {
+	t.Helper()
+	registerAllEq.Do(func() {
+		sqlite.MustRegisterCollationUtf8("ALLEQ", func(string, string) int { return 0 })
+	})
+	return openSQLite(t, sqlitePath(t))
+}
+
+// The WHERE predicates of the required indexes compare origin and run_id with
+// their declared collation. Declared ALLEQ (all strings equal), origin =
+// 'AUTOMATIC' holds for every row, so a second explicit intent conflicts in
+// intents_auto_key, and a non-empty run_id holds for no row, so intents_run_id
+// indexes nothing and no longer enforces unique run IDs. The open refuses
+// either schema and changes nothing, even when the index keys themselves are
+// BINARY. Declared BINARY explicitly, both open.
+func TestSQLiteStore_PredicateColumnsMustBeBinary(t *testing.T) {
+	const (
+		originCol = "origin                         TEXT NOT NULL"
+		runIDCol  = "run_id                         TEXT NOT NULL"
+	)
+	cases := []struct {
+		name   string
+		schema *strings.Replacer
+		opens  bool
+	}{
+		{"origin-alleq", strings.NewReplacer(originCol, "origin TEXT COLLATE ALLEQ NOT NULL"), false},
+		{"origin-alleq-quoted", strings.NewReplacer(originCol, `origin TEXT NOT NULL COLLATE "alleq"`), false},
+		{"run-id-alleq-binary-key", strings.NewReplacer(
+			runIDCol, "run_id TEXT COLLATE ALLEQ NOT NULL",
+			"(run_id)", "(run_id COLLATE BINARY)"), false},
+		{"explicit-binary", strings.NewReplacer(
+			originCol, "origin TEXT COLLATE BINARY NOT NULL",
+			runIDCol, "run_id TEXT NOT NULL COLLATE binary"), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			db := openSQLiteWithAllEq(t)
+			s := newSQLiteStore(t, db)
+			if _, created, err := s.createExplicit(ctx, explicitDraft("op-1")); err != nil || !created {
+				t.Fatalf("create op-1: created=%v err=%v", created, err)
+			}
+			auto := mustCreateAutomatic(t, s, "subject-1")
+			if _, err := s.AttachRunID(ctx, auto.ID, "run-1"); err != nil {
+				t.Fatalf("attach run-1: %v", err)
+			}
+			for _, stmt := range rebuildIntents(tc.schema.Replace(sqliteSchema)) {
+				if _, err := db.Exec(stmt); err != nil {
+					t.Fatalf("%s: %v", stmt, err)
+				}
+			}
+			before := dbSnapshot(t, db)
+			s, err := NewSQLiteStore(ctx, db)
+			if !tc.opens {
+				if ps.CodeOf(err) != ps.CodeIntegrity || s != nil {
+					detail := ""
+					if s != nil {
+						_, _, eerr := s.createExplicit(ctx, explicitDraft("op-2"))
+						other, _, aerr := s.createAutomatic(ctx, automaticDraft("subject-2"))
+						if aerr == nil {
+							_, aerr = s.AttachRunID(ctx, other.ID, "run-1")
+						}
+						detail = fmt.Sprintf("; creating op-2 gives %v, attaching run-1 to a second intent gives %v", eerr, aerr)
+					}
+					t.Fatalf("NewSQLiteStore: store=%v err=%v, want %s%s", s, err, ps.CodeIntegrity, detail)
+				}
+				if after := dbSnapshot(t, db); !reflect.DeepEqual(after, before) {
+					t.Fatalf("refused open changed the database\nbefore=%q\nafter=%q", before, after)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("NewSQLiteStore with BINARY predicate columns: %v", err)
+			}
+			if after := dbSnapshot(t, db); !reflect.DeepEqual(after, before) {
+				t.Fatalf("open changed the database\nbefore=%q\nafter=%q", before, after)
+			}
+			if _, created, err := s.createExplicit(ctx, explicitDraft("op-2")); err != nil || !created {
+				t.Fatalf("create op-2 next to op-1: created=%v err=%v", created, err)
+			}
+			other := mustCreateAutomatic(t, s, "subject-2")
+			if _, err := s.AttachRunID(ctx, other.ID, "run-1"); err == nil {
+				t.Fatal("attaching run-1 to a second intent succeeded, want a conflict")
+			}
+		})
 	}
 }
 
