@@ -645,6 +645,63 @@ func TestSQLiteStore_TempShadowTablesDoNotCaptureWrites(t *testing.T) {
 	}
 }
 
+// A TEMP trigger on main.intents planted on pooled connections after the open
+// check passed is not visible to that check. Every write on such a connection
+// fails with CodeIntegrity instead of being refused or rewritten by the
+// trigger, and nothing is written. Both connections of a two-connection pool
+// are contaminated, so whichever one a write gets is a contaminated one.
+func TestSQLiteStore_TempTriggerOnPooledConnectionRefusesWrites(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		trigger string
+	}{
+		{"narrowing", "CREATE TEMP TRIGGER narrowed BEFORE INSERT ON main.intents BEGIN SELECT RAISE(ABORT, 'narrowed'); END"},
+		{"rewriting", "CREATE TEMP TRIGGER rewritten AFTER UPDATE ON main.intents BEGIN UPDATE main.intents SET auto_run_policy_id = 'other' WHERE intent_id = NEW.intent_id; END"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			db, err := sql.Open("sqlite", sqlitePath(t))
+			if err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			db.SetMaxOpenConns(2)
+			t.Cleanup(func() { _ = db.Close() })
+			s := newSQLiteStore(t, db)
+			stored := mustCreateAutomatic(t, s, "subject-1")
+
+			conns := make([]*sql.Conn, 2)
+			for i := range conns {
+				if conns[i], err = db.Conn(ctx); err != nil {
+					t.Fatalf("conn %d: %v", i, err)
+				}
+				if _, err := conns[i].ExecContext(ctx, tc.trigger); err != nil {
+					t.Fatalf("plant trigger on conn %d: %v", i, err)
+				}
+			}
+			for _, c := range conns {
+				_ = c.Close()
+			}
+			before := dbSnapshot(t, db)
+
+			if _, _, err := s.createAutomatic(ctx, automaticDraft("subject-2")); ps.CodeOf(err) != ps.CodeIntegrity {
+				t.Fatalf("create on a contaminated connection: err = %v, want CodeIntegrity", err)
+			}
+			if _, err := s.AttachRunID(ctx, stored.ID, "run-1"); ps.CodeOf(err) != ps.CodeIntegrity {
+				t.Fatalf("attach on a contaminated connection: err = %v, want CodeIntegrity", err)
+			}
+			if _, err := s.UpdateBlocker(ctx, stored.ID, BlockerMaterializationPrereq, BlockerBlocked); ps.CodeOf(err) != ps.CodeIntegrity {
+				t.Fatalf("blocker update on a contaminated connection: err = %v, want CodeIntegrity", err)
+			}
+			if after := dbSnapshot(t, db); !reflect.DeepEqual(after, before) {
+				t.Fatalf("refused writes mutated the database:\nbefore %q\nafter  %q", before, after)
+			}
+			if got := mustGetIntent(t, s, stored.ID); got != stored {
+				t.Fatalf("stored intent changed: %+v, want %+v", got, stored)
+			}
+		})
+	}
+}
+
 // failingIndexRows yields one well-formed index row and then stops with an
 // iteration error, as *sql.Rows does when reading a later row fails.
 type failingIndexRows struct {

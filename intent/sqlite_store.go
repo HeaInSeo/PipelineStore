@@ -749,6 +749,14 @@ func (s *SQLiteStore) conn(ctx context.Context) (*sql.Conn, error) {
 
 // write runs fn inside one BEGIN IMMEDIATE transaction and commits only if fn
 // succeeds; any error rolls every write of the call back.
+//
+// Each pooled connection has its own TEMP schema, so the open-time trigger
+// check cannot see a TEMP trigger on another connection or one created after
+// open. verifyNoTriggers therefore runs again on the connection that will
+// write, inside the transaction: a TEMP trigger can only be created on this
+// connection, which the call holds, and a main trigger needs the write lock the
+// transaction holds, so none can appear between the check and fn. Reads fire
+// no triggers and need no check.
 func (s *SQLiteStore) write(ctx context.Context, fn func(conn *sql.Conn) error) (err error) {
 	conn, err := s.conn(ctx)
 	if err != nil {
@@ -764,6 +772,9 @@ func (s *SQLiteStore) write(ctx context.Context, fn func(conn *sql.Conn) error) 
 			_, _ = conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK")
 		}
 	}()
+	if err := verifyNoTriggers(ctx, conn); err != nil {
+		return err
+	}
 	if err := fn(conn); err != nil {
 		return err
 	}
